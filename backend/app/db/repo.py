@@ -39,7 +39,7 @@ class Repository:
 
     # Conversations -----------------------------------------------------------------
     def create_conversation(self, user_id: str, title: str = "Conversation") -> str:
-        record = {"user_id": user_id, "title": title}
+        record = {"user_id": user_id, "title": title, "status": "ai"}  # 默认 AI 接管
         if self.client:
             res = self.client.table("conversations").insert(record).execute()
             return res.data[0]["id"]
@@ -48,6 +48,7 @@ class Repository:
             "id": conversation_id,
             "user_id": user_id,
             "title": title,
+            "status": "ai",
             "created_at": self._now(),
         }
         self.memory["messages"][conversation_id] = []

@@ -40,6 +40,7 @@ type Msg = {
   role: string;
   content: string;
   created_at?: string;
+  client_message_id?: string;
   audio_url?: string | null;
   transcript?: string | null;
   metadata?: { duration?: number } | null;
@@ -139,6 +140,37 @@ export default function InboxPage() {
       }
     };
     loadConvos();
+    
+    // 实时订阅 conversations 状态变化（用于"需人工"提示）
+    const convChannel = supabase
+      .channel('admin-conversations-status')
+      .on(
+        "postgres_changes",
+        { 
+          event: "UPDATE", 
+          schema: "public", 
+          table: "conversations"
+        },
+        (payload) => {
+          const updated = payload.new as Conversation;
+          console.log("[Admin] 对话状态更新:", updated.id, "->", updated.status);
+          
+          setConversations((prev) => 
+            prev.map((c) => 
+              c.id === updated.id 
+                ? { ...c, status: updated.status, assigned_agent_id: updated.assigned_agent_id } 
+                : c
+            )
+          );
+        }
+      )
+      .subscribe((status) => {
+        console.log("S端 Conversations Realtime 订阅状态:", status);
+      });
+    
+    return () => {
+      supabase.removeChannel(convChannel);
+    };
   }, [session?.user, activeId]);
 
   // 消息加载和实时订阅
@@ -193,9 +225,6 @@ export default function InboxPage() {
             // 严格去重：检查ID是否已存在
             if (loadedMsgIds.has(newMsg.id)) return;
             loadedMsgIds.add(newMsg.id);
-            
-            // 客服消息已在sendReply中添加，跳过
-            if (newMsg.role === 'agent') return;
             
             setMessages((prev) => {
               // 双重检查
@@ -258,10 +287,10 @@ export default function InboxPage() {
     const text = input.trim();
     setInput("");
     
-    // 生成临时ID，立即显示
-    const tempId = `temp-${Date.now()}`;
+    const messageId = crypto.randomUUID();
     const tempMsg: Msg = {
-      id: tempId,
+      id: messageId,
+      client_message_id: messageId,
       conversation_id: activeId,
       user_id: session.user.id,
       role: 'agent',
@@ -281,17 +310,27 @@ export default function InboxPage() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${session.access_token}`,
         },
-        body: JSON.stringify({ conversation_id: activeId, content: text }),
+        body: JSON.stringify({
+          conversation_id: activeId,
+          content: text,
+          id: messageId,
+          client_message_id: messageId,
+        }),
       });
+      
+      if (!response.ok) {
+        setMessages((prev) => prev.filter(m => m.id !== messageId));
+        return;
+      }
       
       const result = await response.json();
       
-      // 3. 用真实消息替换临时消息
-      if (result.id) {
-        setMessages((prev) => prev.map(m => m.id === tempId ? { ...m, id: result.id } : m));
+      if (result?.id) {
+        setMessages((prev) => prev.map(m => m.id === messageId ? { ...m, ...result } : m));
       }
     } catch (err) {
       console.error("send reply error", err);
+      setMessages((prev) => prev.filter(m => m.id !== messageId));
     }
   };
 
@@ -336,7 +375,7 @@ export default function InboxPage() {
     if (!activeId || !session?.access_token) return;
     
     try {
-      const response = await fetch(`http://localhost:8000/api/conversations/${activeId}/assign`, {
+      const response = await fetch(`/api/admin/conversations/${activeId}/assign`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -365,6 +404,43 @@ export default function InboxPage() {
       }
     } catch (err) {
       console.error("接管错误:", err);
+    }
+  };
+
+  const handleReleaseConversation = async () => {
+    if (!activeId || !session?.access_token) return;
+    
+    try {
+      const response = await fetch(`/api/admin/conversations/${activeId}/release`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({})
+      });
+      
+      const result = await response.json();
+      
+      if (result.ok) {
+        setConversations(prev => prev.map(c => 
+          c.id === activeId 
+            ? { ...c, status: 'ai', assigned_agent_id: null } 
+            : c
+        ));
+        
+        // 刷新消息列表
+        const refreshed = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        }).then((r) => r.json());
+        setMessages((refreshed.items as Msg[]) || []);
+        
+        console.log("✅ 已取消接管，AI 恢复工作");
+      } else {
+        console.error("取消接管失败:", result);
+      }
+    } catch (err) {
+      console.error("取消接管错误:", err);
     }
   };
 
@@ -404,8 +480,8 @@ export default function InboxPage() {
         )}
         <div className={`max-w-[60%] p-4 rounded-xl text-sm leading-relaxed shadow-sm ${
           msg.role === 'user' 
-            ? 'bg-white border border-gray-200 text-gray-800 rounded-tl-none' 
-            : 'bg-blue-600 text-white rounded-tr-none'
+            ? 'bg-black text-white rounded-tl-none' 
+            : 'bg-white border border-slate-200 text-slate-900 rounded-tr-none'
         }`}
         onContextMenu={(e) => {
           if (voice?.url) {
@@ -465,23 +541,37 @@ export default function InboxPage() {
             msg.content
           )}
           {msg.role === 'assistant' && !voice && (
-            <div className="text-[10px] text-blue-200 mt-2 flex items-center gap-1">
+            <div className="text-[10px] text-blue-500 mt-2 flex items-center gap-1">
               {Icons.Zap} AI Confidence: 94%
             </div>
           )}
         </div>
+        {/* 管理端：AI和客服消息都显示头像 */}
         {!isUser && (
-          msg.role === "agent" ? (
-            <div className="w-8 h-8 bg-black rounded-full flex items-center justify-center text-white text-xs ml-3 flex-shrink-0">
+          msg.role === "assistant" ? (
+            // AI 消息 - 机器人头像
+            <div className="w-9 h-9 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white ml-3 flex-shrink-0 shadow-md">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="11" width="18" height="10" rx="2"/>
+                <circle cx="12" cy="5" r="2"/>
+                <path d="M12 7v4"/>
+                <line x1="8" y1="16" x2="8" y2="16"/>
+                <line x1="16" y1="16" x2="16" y2="16"/>
+              </svg>
+            </div>
+          ) : msg.role === "agent" ? (
+            // 客服消息 - 客服头像
+            <div className="w-9 h-9 bg-green-500 rounded-full flex items-center justify-center text-white ml-3 flex-shrink-0 shadow-md">
               {currentAgentProfile?.avatar_url ? (
                 <img src={currentAgentProfile.avatar_url} alt="Agent" className="w-full h-full object-cover rounded-full" />
               ) : (
-                "AI"
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                  <circle cx="12" cy="7" r="4"/>
+                </svg>
               )}
             </div>
-          ) : (
-            <div className="w-8 h-8 bg-black rounded-full flex items-center justify-center text-white text-xs ml-3 flex-shrink-0">AI</div>
-          )
+          ) : null
         )}
       </div>
     );
@@ -502,6 +592,8 @@ export default function InboxPage() {
           {conversations.map((c) => {
             const p = profiles[c.user_id] || ({} as Profile);
             const isPending = c.status === 'pending_agent';
+            const isAgent = c.status === 'agent';
+            const isMyAssignment = isAgent && c.assigned_agent_id === session?.user?.id;
             
             return (
               <div
@@ -510,7 +602,9 @@ export default function InboxPage() {
                 className={`p-4 border-b border-gray-50 hover:bg-gray-50 cursor-pointer ${
                   activeId === c.id ? 'bg-blue-50/50' : ''
                 } ${
-                  isPending ? 'border-l-4 border-l-blue-500' : ''
+                  isPending ? 'border-l-4 border-l-yellow-500' : ''
+                } ${
+                  isAgent ? 'border-l-4 border-l-green-500' : ''
                 }`}
               >
                 <div className="flex justify-between items-start mb-1">
@@ -525,13 +619,18 @@ export default function InboxPage() {
                     </span>
                   )}
                   {c.status === 'pending_agent' && (
-                    <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded border border-yellow-200 flex items-center gap-1">
+                    <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded border border-yellow-200 flex items-center gap-1 animate-pulse">
                       ⚠️ 需人工
                     </span>
                   )}
-                  {c.status === 'agent' && (
+                  {isMyAssignment && (
+                    <span className="text-[10px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded border border-green-200 flex items-center gap-1">
+                      👤 人工接管中
+                    </span>
+                  )}
+                  {isAgent && !isMyAssignment && (
                     <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded border border-blue-200 flex items-center gap-1">
-                      👤 人工处理中
+                      👤 其他客服处理
                     </span>
                   )}
                 </div>
@@ -555,24 +654,44 @@ export default function InboxPage() {
             const isPending = conv?.status === 'pending_agent';
             const isAgent = conv?.status === 'agent';
             const isAssigned = isAgent && conv?.assigned_agent_id === session?.user?.id;
+            const isAI = conv?.status === 'ai' || (!isPending && !isAgent);
             
             return (
               <div className="flex gap-3">
                 <button className="px-3 py-1.5 text-xs font-medium border bg-white rounded-md text-gray-600 hover:bg-gray-50">转接同事</button>
-                {isPending && (
+                
+                {/* AI 接管中 或 需人工 - 显示"接管对话"按钮 */}
+                {(isAI || isPending) && (
                   <button 
                     onClick={handleAssignConversation}
-                    className="px-3 py-1.5 text-xs font-medium bg-black text-white rounded-md shadow hover:bg-gray-800 transition flex items-center gap-2"
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md shadow transition flex items-center gap-2 ${
+                      isPending 
+                        ? 'bg-yellow-500 text-white hover:bg-yellow-600 animate-pulse' 
+                        : 'bg-black text-white hover:bg-gray-800'
+                    }`}
                   >
+                    {isPending && <span>⚠️</span>}
                     <span>接管对话</span>
                   </button>
                 )}
+                
+                {/* 已接管 - 显示"取消接管"按钮 */}
                 {isAssigned && (
+                  <button 
+                    onClick={handleReleaseConversation}
+                    className="px-3 py-1.5 text-xs font-medium bg-green-600 text-white rounded-md shadow hover:bg-green-700 transition flex items-center gap-2"
+                  >
+                    <span>✅ 取消接管</span>
+                  </button>
+                )}
+                
+                {/* 其他客服接管 */}
+                {isAgent && !isAssigned && (
                   <button 
                     disabled
                     className="px-3 py-1.5 text-xs font-medium bg-gray-100 text-gray-500 rounded-md border border-gray-200 cursor-not-allowed"
                   >
-                    ✅ 已接管
+                    👤 其他客服处理中
                   </button>
                 )}
               </div>
