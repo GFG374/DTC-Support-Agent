@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import uuid
 from typing import AsyncGenerator, Dict, Optional
 
@@ -7,7 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..agents import qa, router as router_agent
+from ..agents.qa import QAAgent
+from ..agents.router import RouterAgent
+from ..agents.return_planner import ReturnPlannerAgent
+from ..agents import qa as qa_module, router as router_module  # 旧代码兼容
+from ..integrations import get_alipay_client, get_order_api
 from ..core.auth import User, get_current_user
 from ..db.repo import Repository, get_repo
 from ..llm import kimi
@@ -22,6 +27,21 @@ class ChatRequest(BaseModel):
     message: Optional[str] = None
     audio_url: Optional[str] = None
     is_voice: bool = False
+
+
+# ===== 辅助函数 =====
+
+def extract_order_id(text: str) -> Optional[str]:
+    """
+    从用户消息中提取订单号
+    支持格式：ORD20250101001、订单号ORD20250101001等
+    """
+    # 匹配 ORD + 数字
+    pattern = r'ORD\d{11,}'
+    match = re.search(pattern, text.upper())
+    if match:
+        return match.group(0)
+    return None
 
 
 def chunk_text(text: str, chunk_size: int = 80):
@@ -51,7 +71,7 @@ async def chat_endpoint(
     repo.add_message(conversation_id, user.user_id, "user", payload.message)
     trace_id = str(uuid.uuid4())
 
-    route = router_agent.detect_intent(payload.message)
+    route = router_module.detect_intent(payload.message)
     repo.log_event(
         trace_id=trace_id,
         event_type="ROUTE_DECISION",
@@ -84,11 +104,11 @@ async def chat_endpoint(
                 user_id=user.user_id,
             )
         elif route["intent"] == "WISMO":
-            reply = qa.render_wismo_reply()
+            reply = qa_module.render_wismo_reply()
         elif route["intent"] == "FAQ":
-            reply = qa.render_faq_reply()
+            reply = qa_module.render_faq_reply()
         else:
-            reply = qa.render_human_handoff(route)
+            reply = qa_module.render_human_handoff(route)
     except Exception as exc:  # broad: ensure trace_id is recorded on failure
         repo.log_event(
             trace_id=trace_id,
@@ -229,3 +249,83 @@ async def chat_with_kimi(
             "X-Conversation-Id": conversation_id,
         },
     )
+
+
+# ===== 新版响应式 Agent 系统 =====
+
+@router.post("/chat/agent")
+async def chat_with_agent(
+    payload: ChatRequest,
+    user: User = Depends(get_current_user),
+    repo: Repository = Depends(get_repo),
+):
+    """
+    Multi-Agent 系统 - 新架构
+    流程：Q&A Agent (前台) → 调用部门工具 (Kimi Function Calling)
+    
+    注意：用户消息和AI消息都由前端入库，后端不重复入库
+    """
+    conversation_id = payload.conversation_id
+    if not conversation_id:
+        conversation_id = repo.create_conversation(user.user_id)
+
+    user_message = payload.message
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Message required")
+    
+    # 注意：用户消息由前端入库，这里不再入库
+    # repo.add_message(conversation_id, user.user_id, "user", user_message)
+    
+    # 初始化 Q&A Agent（前台）
+    qa_agent = QAAgent()
+    
+    # 获取对话历史
+    history = repo.list_messages(conversation_id, user.user_id)
+    messages = [
+        {"role": item["role"], "content": item["content"]}
+        for item in history
+    ]
+    
+    # 流式响应生成器
+    async def generate_agent_stream():
+        try:
+            # 调用 Q&A Agent（可能会调用部门工具）
+            result = await qa_agent.chat(messages)
+            
+            assistant_reply = result["message"]
+            tool_calls = result.get("tool_calls")
+            
+            # 记录工具调用（如果有）
+            if tool_calls:
+                for tool_call in tool_calls:
+                    tool_name = tool_call["function"]["name"]
+                    print(f"[Agent] 调用工具: {tool_name}")
+                    repo.log_event(
+                        trace_id=str(uuid.uuid4()),
+                        event_type="TOOL_CALL",
+                        payload={"tool": tool_name, "args": tool_call["function"]["arguments"]},
+                        conversation_id=conversation_id,
+                        user_id=user.user_id
+                    )
+            
+            # 流式输出 AI 回复
+            for char in assistant_reply:
+                yield f"data: {json.dumps({'content': char}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.02)  # 模拟打字效果
+            
+            # 注意：AI消息由前端入库，这里不再入库
+            # repo.add_message(conversation_id, user.user_id, "assistant", assistant_reply)
+            
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+        
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_message = f"抱歉，系统出了点小问题 😅 错误：{str(e)}"
+            yield f"data: {json.dumps({'error': error_message}, ensure_ascii=False)}\n\n"
+    
+    return StreamingResponse(
+        generate_agent_stream(),
+        media_type="text/event-stream"
+    )
+

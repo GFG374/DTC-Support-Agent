@@ -13,6 +13,7 @@ type Msg = {
   audio_url?: string | null;
   transcript?: string | null;
   metadata?: { duration?: number } | null;
+  user_id?: string;
 };
 
 // 只去重，不排序（保持添加顺序）
@@ -124,8 +125,24 @@ export default function AssistantPage() {
     
     let isMounted = true;
     const loadedMsgIds = new Set<string>();
+    const cacheKey = `chat_messages_${conversationId}`;
     
     const load = async () => {
+      // 1. 优先从 localStorage 加载
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+          const cachedMsgs = JSON.parse(cached) as Msg[];
+          cachedMsgs.forEach(m => loadedMsgIds.add(m.id));
+          setMessages(dedupe(cachedMsgs));
+          console.log('✅ 从缓存加载消息:', cachedMsgs.length);
+          return; // 有缓存就不从 Supabase 加载了
+        }
+      } catch (e) {
+        console.warn('缓存读取失败:', e);
+      }
+      
+      // 2. 缓存不存在时，从 Supabase 恢复
       const { data, error } = await supabase
         .from("messages")
         .select("*")
@@ -136,18 +153,27 @@ export default function AssistantPage() {
       
       if (!error && data) {
         data.forEach(m => loadedMsgIds.add(m.id));
-        setMessages(dedupe(data as Msg[]));
+        const msgs = dedupe(data as Msg[]);
+        setMessages(msgs);
+        // 保存到缓存
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(msgs));
+          console.log('✅ 从 Supabase 恢复消息并缓存:', msgs.length);
+        } catch (e) {
+          console.warn('缓存保存失败:', e);
+        }
       }
     };
     load();
 
-    // 实时订阅 - 接收所有新消息（用户、AI、系统、客服）
+    // 实时订阅 - 只用于接收其他设备/客服发送的消息
+    // 注意：当前用户发送的消息不通过 Realtime 处理，而是直接在 sendText 中管理
     const channel = supabase
       .channel(`c-msgs-${conversationId}`)
       .on(
         "postgres_changes",
         { 
-          event: "*", 
+          event: "INSERT", 
           schema: "public", 
           table: "messages",
           filter: `conversation_id=eq.${conversationId}`
@@ -155,33 +181,29 @@ export default function AssistantPage() {
         (payload) => {
           if (!isMounted) return;
           
-          if (payload.eventType === "INSERT") {
-            const newRow = payload.new as Msg;
-            
-            // 严格去重
-            if (loadedMsgIds.has(newRow.id)) return;
-            loadedMsgIds.add(newRow.id);
-            
-            setMessages((prev) => {
-              // 检查是否有对应的临时消息需要替换
-              const tempIndex = prev.findIndex(m => 
-                m.id.startsWith('temp-') && 
-                m.role === newRow.role && 
-                Math.abs(new Date(m.created_at).getTime() - new Date(newRow.created_at).getTime()) < 5000
-              );
-              
-              if (tempIndex >= 0) {
-                // 替换临时消息
-                const updated = [...prev];
-                updated[tempIndex] = newRow;
-                return updated;
-              } else {
-                // 新消息（不是替换临时消息的情况，比如系统消息、客服消息）
-                if (prev.some(m => m.id === newRow.id)) return prev;
-                return [...prev, newRow];
-              }
-            });
+          const newRow = payload.new as Msg;
+          
+          // 跳过当前用户发送的消息（已在 sendText 中处理）
+          if (newRow.user_id === session?.user?.id) {
+            console.log('跳过当前用户消息（已本地处理）:', newRow.id);
+            return;
           }
+          
+          // 严格去重
+          if (loadedMsgIds.has(newRow.id)) return;
+          loadedMsgIds.add(newRow.id);
+          
+          console.log('Realtime 收到其他用户消息:', newRow.id);
+          
+          setMessages((prev) => {
+            if (prev.some(m => m.id === newRow.id)) return prev;
+            const updated = [...prev, newRow];
+            // 更新缓存
+            try {
+              localStorage.setItem(cacheKey, JSON.stringify(updated));
+            } catch (e) {}
+            return updated;
+          });
         }
       )
       .subscribe((status) => {
@@ -245,8 +267,10 @@ export default function AssistantPage() {
     setInput("");
     setError(null);
     
+    const cacheKey = `chat_messages_${conversationId}`;
+    
     // 生成临时ID，用于即时显示
-    const tempId = `temp-${Date.now()}`;
+    const tempId = `temp-user-${Date.now()}`;
     const tempMsg: Msg = {
       id: tempId,
       role: 'user',
@@ -255,10 +279,19 @@ export default function AssistantPage() {
     };
     
     // 1. 立即显示用户消息（使用临时ID）
-    setMessages((prev) => [...prev, tempMsg]);
+    setMessages((prev) => {
+      const updated = [...prev, tempMsg];
+      // 立即更新缓存
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify(updated));
+      } catch (e) {
+        console.warn('缓存更新失败:', e);
+      }
+      return updated;
+    });
     
     try {
-      // 2. 前端直接入库用户消息
+      // 2. 前端直接入库用户消息（不通过实时订阅添加，防止重复）
       const insertResult = await supabase.from("messages").insert({
         conversation_id: conversationId,
         user_id: session.user.id,
@@ -269,14 +302,27 @@ export default function AssistantPage() {
       if (insertResult.error) {
         console.error("用户消息入库失败:", insertResult.error);
         setError("消息发送失败");
-        setMessages((prev) => prev.filter(m => m.id !== tempId));
+        setMessages((prev) => {
+          const filtered = prev.filter(m => m.id !== tempId);
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(filtered));
+          } catch (e) {}
+          return filtered;
+        });
+        setSending(false);
         return;
       }
       
       // 3. 用真实ID替换临时ID
       if (insertResult.data) {
         const realMsg = insertResult.data as Msg;
-        setMessages((prev) => prev.map(m => m.id === tempId ? realMsg : m));
+        setMessages((prev) => {
+          const updated = prev.map(m => m.id === tempId ? realMsg : m);
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(updated));
+          } catch (e) {}
+          return updated;
+        });
       }
       
       // 4. 调用AI，后端会入库AI回复
@@ -289,9 +335,15 @@ export default function AssistantPage() {
       };
       
       // 添加空的AI消息作为占位符
-      setMessages((prev) => [...prev, aiTempMsg]);
+      setMessages((prev) => {
+        const updated = [...prev, aiTempMsg];
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(updated));
+        } catch (e) {}
+        return updated;
+      });
       
-      const response = await fetch("/api/chat-kimi", {
+      const response = await fetch("/api/chat-agent", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -302,7 +354,14 @@ export default function AssistantPage() {
       
       if (!response.ok) {
         setError("AI 回复接口失败");
-        setMessages((prev) => prev.filter(m => m.id !== aiTempId));
+        setMessages((prev) => {
+          const filtered = prev.filter(m => m.id !== aiTempId);
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(filtered));
+          } catch (e) {}
+          return filtered;
+        });
+        setSending(false);
         return;
       }
       
@@ -327,14 +386,36 @@ export default function AssistantPage() {
                 if (data.content) {
                   // 逐步更新AI回复内容
                   aiContent += data.content;
-                  setMessages((prev) => prev.map(m => 
-                    m.id === aiTempId ? { ...m, content: aiContent } : m
-                  ));
+                  setMessages((prev) => {
+                    const updated = prev.map(m => 
+                      m.id === aiTempId ? { ...m, content: aiContent } : m
+                    );
+                    try {
+                      localStorage.setItem(cacheKey, JSON.stringify(updated));
+                    } catch (e) {}
+                    return updated;
+                  });
                 }
                 
                 if (data.done) {
-                  // 流式响应完成，AI消息已由后端入库
-                  // 等待 Realtime 推送真实的 AI 消息，替换临时消息
+                  // 流式响应完成，将AI消息入库
+                  const aiInsertResult = await supabase.from("messages").insert({
+                    conversation_id: conversationId,
+                    user_id: session.user.id,
+                    role: "assistant",
+                    content: aiContent,
+                  }).select().single();
+                  
+                  if (aiInsertResult.data) {
+                    const realAiMsg = aiInsertResult.data as Msg;
+                    setMessages((prev) => {
+                      const updated = prev.map(m => m.id === aiTempId ? realAiMsg : m);
+                      try {
+                        localStorage.setItem(cacheKey, JSON.stringify(updated));
+                      } catch (e) {}
+                      return updated;
+                    });
+                  }
                   break;
                 }
               } catch (e) {
@@ -459,6 +540,8 @@ export default function AssistantPage() {
 
     // 无论上传成功与否，都发送消息
     if (publicUrl && session?.user) {
+      const cacheKey = `chat_messages_${conversationId}`;
+      
       // 生成临时ID和临时消息，立即显示
       const tempId = `temp-voice-${Date.now()}`;
       const tempMsg: Msg = {
@@ -470,7 +553,13 @@ export default function AssistantPage() {
       };
       
       // 1. 立即显示语音消息
-      setMessages((prev) => [...prev, tempMsg]);
+      setMessages((prev) => {
+        const updated = [...prev, tempMsg];
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(updated));
+        } catch (e) {}
+        return updated;
+      });
       
       // 2. 入库
       const insertResult = await supabase.from("messages").insert({
@@ -484,6 +573,13 @@ export default function AssistantPage() {
       if (insertResult.error) {
         console.error("插入消息失败:", insertResult.error);
         setError("发送失败");
+        setMessages((prev) => {
+          const filtered = prev.filter(m => m.id !== tempId);
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(filtered));
+          } catch (e) {}
+          return filtered;
+        });
         return;
       }
 
@@ -492,7 +588,13 @@ export default function AssistantPage() {
       // 3. 用真实ID替换临时ID
       if (insertResult.data) {
         const realMsg = insertResult.data as Msg;
-        setMessages((prev) => prev.map(m => m.id === tempId ? realMsg : m));
+        setMessages((prev) => {
+          const updated = prev.map(m => m.id === tempId ? realMsg : m);
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(updated));
+          } catch (e) {}
+          return updated;
+        });
       }
 
       // 自动调用转写（用于AI理解）- WAV格式阿里云直接支持，异步不等待
@@ -520,10 +622,16 @@ export default function AssistantPage() {
       };
       
       // 添加空的AI消息作为占位符
-      setMessages((prev) => [...prev, aiTempMsg]);
+      setMessages((prev) => {
+        const updated = [...prev, aiTempMsg];
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(updated));
+        } catch (e) {}
+        return updated;
+      });
       
       try {
-        const response = await fetch("/api/chat-kimi", {
+        const response = await fetch("/api/chat-agent", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -538,7 +646,13 @@ export default function AssistantPage() {
         
         if (!response.ok) {
           setError("AI 回复接口失败");
-          setMessages((prev) => prev.filter(m => m.id !== aiTempId));
+          setMessages((prev) => {
+            const filtered = prev.filter(m => m.id !== aiTempId);
+            try {
+              localStorage.setItem(cacheKey, JSON.stringify(filtered));
+            } catch (e) {}
+            return filtered;
+          });
           return;
         }
         
@@ -563,14 +677,36 @@ export default function AssistantPage() {
                   if (data.content) {
                     // 逐步更新AI回复内容
                     aiContent += data.content;
-                    setMessages((prev) => prev.map(m => 
-                      m.id === aiTempId ? { ...m, content: aiContent } : m
-                    ));
+                    setMessages((prev) => {
+                      const updated = prev.map(m => 
+                        m.id === aiTempId ? { ...m, content: aiContent } : m
+                      );
+                      try {
+                        localStorage.setItem(cacheKey, JSON.stringify(updated));
+                      } catch (e) {}
+                      return updated;
+                    });
                   }
                   
                   if (data.done) {
-                    // 流式响应完成，AI消息已由后端入库
-                    // 等待 Realtime 推送
+                    // 流式响应完成，将AI消息入库
+                    const aiInsertResult = await supabase.from("messages").insert({
+                      conversation_id: conversationId,
+                      user_id: session.user.id,
+                      role: "assistant",
+                      content: aiContent,
+                    }).select().single();
+                    
+                    if (aiInsertResult.data) {
+                      const realAiMsg = aiInsertResult.data as Msg;
+                      setMessages((prev) => {
+                        const updated = prev.map(m => m.id === aiTempId ? realAiMsg : m);
+                        try {
+                          localStorage.setItem(cacheKey, JSON.stringify(updated));
+                        } catch (e) {}
+                        return updated;
+                      });
+                    }
                     break;
                   }
                 } catch (e) {
@@ -605,7 +741,7 @@ export default function AssistantPage() {
       
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      await fetch("/api/chat-kimi", {
+      await fetch("/api/chat-agent", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -734,7 +870,10 @@ export default function AssistantPage() {
               
               <div
                 className={`max-w-[82%] p-3 rounded-2xl text-sm leading-relaxed shadow-sm whitespace-pre-line ${
-                  isUserSide ? "bg-black text-white rounded-br-none" : "bg-white text-gray-800 border border-gray-100 rounded-bl-none"
+                  // 用户消息：黑底白字；AI/客服：白底深色字
+                  isUserSide
+                    ? "bg-black text-white rounded-br-none"
+                    : "bg-white text-slate-900 border border-slate-200 rounded-bl-none"
                 }`}
               >
                 {voice ? (
