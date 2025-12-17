@@ -31,12 +31,13 @@ class QAAgent:
         self.return_planner = ReturnPlannerAgent()
         self.order_agent = OrderAgent()
     
-    async def chat(self, messages: List[Dict[str, str]]) -> Dict:
+    async def chat(self, messages: List[Dict[str, str]], max_retries: int = 2) -> Dict:
         """
         与用户对话
         
         Args:
             messages: 对话历史 [{"role": "user", "content": "..."}]
+            max_retries: 最大重试次数
             
         Returns:
             {
@@ -51,35 +52,50 @@ class QAAgent:
             "content": QA_AGENT_PROMPT
         }
         
-        # 限制消息历史长度（防止 token 超限）
-        # 只保留最近 20 条消息（10轮对话）
-        MAX_MESSAGES = 20
+        # 限制消息数量，避免超出 Kimi 上下文限制
+        MAX_MESSAGES = 30
         if len(messages) > MAX_MESSAGES:
-            print(f"[QA Agent] 消息历史过长({len(messages)}条)，截断至最近{MAX_MESSAGES}条")
             messages = messages[-MAX_MESSAGES:]
+            print(f"[QA Agent] 消息数超过 {MAX_MESSAGES}，截取最近 {MAX_MESSAGES} 条")
         
         print(f"[QA Agent] 发送请求到 Kimi, 消息数: {len(messages)}")
         
-        # 调用 Kimi API
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{self.api_base}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "kimi-k2-turbo-preview",
-                    "messages": [system_message] + messages,
-                    "tools": QA_AGENT_TOOLS,
-                    "temperature": 0.7
-                }
-            )
-            
-            print(f"[QA Agent] Kimi 响应状态: {response.status_code}")
-            response.raise_for_status()
-            result = response.json()
-            print(f"[QA Agent] Kimi 响应: finish_reason={result['choices'][0]['finish_reason']}")
+        # 调用 Kimi API（带重试机制）
+        last_error = None
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(
+                        f"{self.api_base}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": "kimi-k2-turbo-preview",
+                            "messages": [system_message] + messages,
+                            "tools": QA_AGENT_TOOLS,
+                            "temperature": 0.7
+                        }
+                    )
+                    
+                    print(f"[QA Agent] Kimi 响应状态: {response.status_code}")
+                    response.raise_for_status()
+                    break  # 成功则跳出重试循环
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    print(f"[QA Agent] 请求失败，重试 {attempt + 1}/{max_retries}: {str(e)}")
+                    import asyncio
+                    await asyncio.sleep(1)  # 等待1秒后重试
+                else:
+                    print(f"[QA Agent] 请求失败，已达最大重试次数: {str(e)}")
+                    raise last_error
+        
+        # 解析响应（在 for 循环外部）
+        result = response.json()
+        print(f"[QA Agent] Kimi 响应: finish_reason={result['choices'][0]['finish_reason']}")
         
         # 解析响应
         choice = result["choices"][0]

@@ -80,22 +80,23 @@ async def admin_add_message(
 ):
     conversation_id = payload.get("conversation_id")
     content = payload.get("content")
+    message_id = payload.get("id")
+    client_message_id = payload.get("client_message_id") or message_id
     if not conversation_id or not content:
         raise HTTPException(status_code=400, detail="conversation_id and content required")
     client = get_supabase_admin_client()
     try:
-        res = (
-            client.table("messages")
-            .insert(
-                {
-                    "conversation_id": conversation_id,
-                    "user_id": user.user_id,
-                    "role": "agent",
-                    "content": content,
-                }
-            )
-            .execute()
-        )
+        record = {
+            "conversation_id": conversation_id,
+            "user_id": user.user_id,
+            "role": "agent",
+            "content": content,
+        }
+        if message_id:
+            record["id"] = message_id
+        if client_message_id:
+            record["client_message_id"] = client_message_id
+        res = client.table("messages").upsert(record, on_conflict="id").execute()
         return res.data[0] if res.data else {}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"insert failed: {exc}")

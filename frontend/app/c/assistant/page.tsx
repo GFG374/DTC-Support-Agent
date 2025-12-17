@@ -10,6 +10,8 @@ type Msg = {
   role: "user" | "assistant" | "agent" | "system" | "ai_voice";
   content: string;
   created_at?: string;
+  conversation_id?: string;
+  client_message_id?: string;
   audio_url?: string | null;
   transcript?: string | null;
   metadata?: { duration?: number } | null;
@@ -21,6 +23,17 @@ const dedupe = (arr: Msg[]) => {
   const map = new Map<string, Msg>();
   arr.forEach((m) => map.set(m.id, m));
   return Array.from(map.values());
+};
+
+const createMessageId = () => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 };
 
 const parseVoice = (msg: Msg) => {
@@ -66,6 +79,8 @@ export default function AssistantPage() {
   const [userProfile, setUserProfile] = useState<{ display_name?: string; avatar_url?: string } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
+  // 客服头像缓存：user_id -> avatar_url
+  const [agentAvatars, setAgentAvatars] = useState<Record<string, string | null>>({});
   const wavRecorderRef = useRef<WavRecorder | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -128,21 +143,19 @@ export default function AssistantPage() {
     const cacheKey = `chat_messages_${conversationId}`;
     
     const load = async () => {
-      // 1. 优先从 localStorage 加载
+      let cachedMsgs: Msg[] = [];
       try {
         const cached = localStorage.getItem(cacheKey);
         if (cached) {
-          const cachedMsgs = JSON.parse(cached) as Msg[];
+          cachedMsgs = JSON.parse(cached) as Msg[];
           cachedMsgs.forEach(m => loadedMsgIds.add(m.id));
           setMessages(dedupe(cachedMsgs));
-          console.log('✅ 从缓存加载消息:', cachedMsgs.length);
-          return; // 有缓存就不从 Supabase 加载了
         }
       } catch (e) {
-        console.warn('缓存读取失败:', e);
+        console.warn("Cache read failed:", e);
       }
-      
-      // 2. 缓存不存在时，从 Supabase 恢复
+
+      // Load from Supabase
       const { data, error } = await supabase
         .from("messages")
         .select("*")
@@ -153,21 +166,19 @@ export default function AssistantPage() {
       
       if (!error && data) {
         data.forEach(m => loadedMsgIds.add(m.id));
-        const msgs = dedupe(data as Msg[]);
-        setMessages(msgs);
-        // 保存到缓存
+        const merged = dedupe([...cachedMsgs, ...(data as Msg[])]);
+        setMessages(merged);
+        // Update cache
         try {
-          localStorage.setItem(cacheKey, JSON.stringify(msgs));
-          console.log('✅ 从 Supabase 恢复消息并缓存:', msgs.length);
+          localStorage.setItem(cacheKey, JSON.stringify(merged));
         } catch (e) {
-          console.warn('缓存保存失败:', e);
+          console.warn("Cache write failed:", e);
         }
       }
     };
     load();
 
-    // 实时订阅 - 只用于接收其他设备/客服发送的消息
-    // 注意：当前用户发送的消息不通过 Realtime 处理，而是直接在 sendText 中管理
+    // 实时订阅 - 接收所有新消息，使用 ID 去重
     const channel = supabase
       .channel(`c-msgs-${conversationId}`)
       .on(
@@ -182,12 +193,6 @@ export default function AssistantPage() {
           if (!isMounted) return;
           
           const newRow = payload.new as Msg;
-          
-          // 跳过当前用户发送的消息（已在 sendText 中处理）
-          if (newRow.user_id === session?.user?.id) {
-            console.log('跳过当前用户消息（已本地处理）:', newRow.id);
-            return;
-          }
           
           // 严格去重
           if (loadedMsgIds.has(newRow.id)) return;
@@ -215,6 +220,37 @@ export default function AssistantPage() {
       supabase.removeChannel(channel);
     };
   }, [conversationId]);
+
+  // 加载客服头像
+  useEffect(() => {
+    const loadAgentAvatars = async () => {
+      // 找出所有 agent 消息的 user_id
+      const agentUserIds = messages
+        .filter(m => m.role === 'agent' && m.user_id && !agentAvatars[m.user_id])
+        .map(m => m.user_id!)
+        .filter((v, i, a) => a.indexOf(v) === i); // 去重
+      
+      if (agentUserIds.length === 0) return;
+      
+      // 查询这些客服的头像
+      const { data } = await supabase
+        .from('user_profiles')
+        .select('user_id, avatar_url')
+        .in('user_id', agentUserIds);
+      
+      if (data && data.length > 0) {
+        setAgentAvatars(prev => {
+          const updated = { ...prev };
+          data.forEach(p => {
+            updated[p.user_id] = p.avatar_url;
+          });
+          return updated;
+        });
+      }
+    };
+    
+    loadAgentAvatars();
+  }, [messages]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -268,42 +304,48 @@ export default function AssistantPage() {
     setError(null);
     
     const cacheKey = `chat_messages_${conversationId}`;
-    
-    // 生成临时ID，用于即时显示
-    const tempId = `temp-user-${Date.now()}`;
-    const tempMsg: Msg = {
-      id: tempId,
+    const messageId = createMessageId();
+    const userMsg: Msg = {
+      id: messageId,
       role: 'user',
       content: text,
       created_at: new Date().toISOString(),
+      conversation_id: conversationId ?? undefined,
+      user_id: session.user.id,
+      client_message_id: messageId,
     };
     
-    // 1. 立即显示用户消息（使用临时ID）
+    // 1. Show user message immediately
     setMessages((prev) => {
-      const updated = [...prev, tempMsg];
-      // 立即更新缓存
+      const updated = [...prev, userMsg];
       try {
         localStorage.setItem(cacheKey, JSON.stringify(updated));
       } catch (e) {
-        console.warn('缓存更新失败:', e);
+        console.warn("Cache update failed:", e);
       }
       return updated;
     });
     
     try {
-      // 2. 前端直接入库用户消息（不通过实时订阅添加，防止重复）
-      const insertResult = await supabase.from("messages").insert({
-        conversation_id: conversationId,
-        user_id: session.user.id,
-        role: "user",
-        content: text,
-      }).select().single();
+      // 2. Persist user message with client ID
+      const insertResult = await supabase
+        .from("messages")
+        .upsert({
+          id: messageId,
+          client_message_id: messageId,
+          conversation_id: conversationId ?? undefined,
+          user_id: session.user.id,
+          role: "user",
+          content: text,
+        }, { onConflict: "id" })
+        .select()
+        .single();
       
       if (insertResult.error) {
-        console.error("用户消息入库失败:", insertResult.error);
+        console.error("User message insert failed:", insertResult.error);
         setError("消息发送失败");
         setMessages((prev) => {
-          const filtered = prev.filter(m => m.id !== tempId);
+          const filtered = prev.filter(m => m.id !== messageId);
           try {
             localStorage.setItem(cacheKey, JSON.stringify(filtered));
           } catch (e) {}
@@ -313,11 +355,10 @@ export default function AssistantPage() {
         return;
       }
       
-      // 3. 用真实ID替换临时ID
       if (insertResult.data) {
         const realMsg = insertResult.data as Msg;
         setMessages((prev) => {
-          const updated = prev.map(m => m.id === tempId ? realMsg : m);
+          const updated = prev.map(m => m.id === messageId ? { ...m, ...realMsg } : m);
           try {
             localStorage.setItem(cacheKey, JSON.stringify(updated));
           } catch (e) {}
@@ -325,16 +366,15 @@ export default function AssistantPage() {
         });
       }
       
-      // 4. 调用AI，后端会入库AI回复
-      const aiTempId = `temp-ai-${Date.now()}`;
+      // 3. Call AI; reply is persisted by client
+      const aiMessageId = createMessageId();
       const aiTempMsg: Msg = {
-        id: aiTempId,
+        id: aiMessageId,
         role: 'assistant',
         content: '',
         created_at: new Date().toISOString(),
       };
       
-      // 添加空的AI消息作为占位符
       setMessages((prev) => {
         const updated = [...prev, aiTempMsg];
         try {
@@ -349,13 +389,13 @@ export default function AssistantPage() {
           "Content-Type": "application/json",
           Authorization: session ? `Bearer ${session.access_token}` : "",
         },
-        body: JSON.stringify({ conversation_id: conversationId, message: text }),
+        body: JSON.stringify({ conversation_id: conversationId ?? undefined, message: text }),
       });
       
       if (!response.ok) {
         setError("AI 回复接口失败");
         setMessages((prev) => {
-          const filtered = prev.filter(m => m.id !== aiTempId);
+          const filtered = prev.filter(m => m.id !== aiMessageId);
           try {
             localStorage.setItem(cacheKey, JSON.stringify(filtered));
           } catch (e) {}
@@ -365,10 +405,11 @@ export default function AssistantPage() {
         return;
       }
       
-      // 读取流式数据
+      // Read SSE stream
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let aiContent = '';
+      let skipAI = false;
       
       if (reader) {
         while (true) {
@@ -382,13 +423,17 @@ export default function AssistantPage() {
             if (line.startsWith('data: ')) {
               try {
                 const data = JSON.parse(line.slice(6));
+
+                if (data.skip) {
+                  skipAI = true;
+                  break;
+                }
                 
                 if (data.content) {
-                  // 逐步更新AI回复内容
                   aiContent += data.content;
                   setMessages((prev) => {
                     const updated = prev.map(m => 
-                      m.id === aiTempId ? { ...m, content: aiContent } : m
+                      m.id === aiMessageId ? { ...m, content: aiContent } : m
                     );
                     try {
                       localStorage.setItem(cacheKey, JSON.stringify(updated));
@@ -398,18 +443,23 @@ export default function AssistantPage() {
                 }
                 
                 if (data.done) {
-                  // 流式响应完成，将AI消息入库
-                  const aiInsertResult = await supabase.from("messages").insert({
-                    conversation_id: conversationId,
-                    user_id: session.user.id,
-                    role: "assistant",
-                    content: aiContent,
-                  }).select().single();
+                  const aiInsertResult = await supabase
+                    .from("messages")
+                    .upsert({
+                      id: aiMessageId,
+                      client_message_id: aiMessageId,
+                      conversation_id: conversationId ?? undefined,
+                      user_id: session.user.id,
+                      role: "assistant",
+                      content: aiContent,
+                    }, { onConflict: "id" })
+                    .select()
+                    .single();
                   
                   if (aiInsertResult.data) {
                     const realAiMsg = aiInsertResult.data as Msg;
                     setMessages((prev) => {
-                      const updated = prev.map(m => m.id === aiTempId ? realAiMsg : m);
+                      const updated = prev.map(m => m.id === aiMessageId ? { ...m, ...realAiMsg } : m);
                       try {
                         localStorage.setItem(cacheKey, JSON.stringify(updated));
                       } catch (e) {}
@@ -419,11 +469,16 @@ export default function AssistantPage() {
                   break;
                 }
               } catch (e) {
-                // 跳过解析错误
+                // Skip parse errors
               }
             }
           }
+          if (skipAI) break;
         }
+      }
+      if (skipAI) {
+        setMessages((prev) => prev.filter(m => m.id !== aiMessageId));
+        return;
       }
     } catch (err) {
       console.error("chat api error", err);
@@ -433,7 +488,6 @@ export default function AssistantPage() {
     }
   };
 
-  // 微信式长按录音开始 - 使用WAV格式录制
   const handlePressStart = async (e: React.TouchEvent | React.MouseEvent) => {
     e.preventDefault(); // 防止默认行为
     if (!conversationId || !session?.user) return;
@@ -542,39 +596,48 @@ export default function AssistantPage() {
     if (publicUrl && session?.user) {
       const cacheKey = `chat_messages_${conversationId}`;
       
-      // 生成临时ID和临时消息，立即显示
-      const tempId = `temp-voice-${Date.now()}`;
-      const tempMsg: Msg = {
-        id: tempId,
+      // Prepare voice message
+      const messageId = createMessageId();
+      const userMsg: Msg = {
+        id: messageId,
         role: 'user',
         content: `[语音 ${duration}秒]`,
         audio_url: publicUrl,
         created_at: new Date().toISOString(),
+        conversation_id: conversationId ?? undefined,
+        user_id: session.user.id,
+        client_message_id: messageId,
       };
       
-      // 1. 立即显示语音消息
+      // Show voice message immediately
       setMessages((prev) => {
-        const updated = [...prev, tempMsg];
+        const updated = [...prev, userMsg];
         try {
           localStorage.setItem(cacheKey, JSON.stringify(updated));
         } catch (e) {}
         return updated;
       });
       
-      // 2. 入库
-      const insertResult = await supabase.from("messages").insert({
-        conversation_id: conversationId,
-        user_id: session.user.id,
-        role: "user",
-        content: `[语音 ${duration}秒]`,
-        audio_url: publicUrl,
-      }).select().single();
+      // Persist voice message
+      const insertResult = await supabase
+        .from("messages")
+        .upsert({
+          id: messageId,
+          client_message_id: messageId,
+          conversation_id: conversationId ?? undefined,
+          user_id: session.user.id,
+          role: "user",
+          content: `[语音 ${duration}秒]`,
+          audio_url: publicUrl,
+        }, { onConflict: "id" })
+        .select()
+        .single();
 
       if (insertResult.error) {
         console.error("插入消息失败:", insertResult.error);
         setError("发送失败");
         setMessages((prev) => {
-          const filtered = prev.filter(m => m.id !== tempId);
+          const filtered = prev.filter(m => m.id !== messageId);
           try {
             localStorage.setItem(cacheKey, JSON.stringify(filtered));
           } catch (e) {}
@@ -583,13 +646,10 @@ export default function AssistantPage() {
         return;
       }
 
-      const messageId = insertResult.data?.id;
-      
-      // 3. 用真实ID替换临时ID
       if (insertResult.data) {
         const realMsg = insertResult.data as Msg;
         setMessages((prev) => {
-          const updated = prev.map(m => m.id === tempId ? realMsg : m);
+          const updated = prev.map(m => m.id === messageId ? { ...m, ...realMsg } : m);
           try {
             localStorage.setItem(cacheKey, JSON.stringify(updated));
           } catch (e) {}
@@ -597,7 +657,6 @@ export default function AssistantPage() {
         });
       }
 
-      // 自动调用转写（用于AI理解）- WAV格式阿里云直接支持，异步不等待
       if (messageId && publicUrl) {
         fetch("/api/transcribe", {
           method: "POST",
@@ -613,9 +672,9 @@ export default function AssistantPage() {
       }
 
       // 4. 调用AI，使用流式响应
-      const aiTempId = `temp-ai-voice-${Date.now()}`;
+      const aiMessageId = createMessageId();
       const aiTempMsg: Msg = {
-        id: aiTempId,
+        id: aiMessageId,
         role: 'assistant',
         content: '',
         created_at: new Date().toISOString(),
@@ -638,7 +697,7 @@ export default function AssistantPage() {
             Authorization: session ? `Bearer ${session.access_token}` : "",
           },
           body: JSON.stringify({ 
-            conversation_id: conversationId, 
+            conversation_id: conversationId ?? undefined, 
             audio_url: publicUrl,
             is_voice: true 
           }),
@@ -647,7 +706,7 @@ export default function AssistantPage() {
         if (!response.ok) {
           setError("AI 回复接口失败");
           setMessages((prev) => {
-            const filtered = prev.filter(m => m.id !== aiTempId);
+            const filtered = prev.filter(m => m.id !== aiMessageId);
             try {
               localStorage.setItem(cacheKey, JSON.stringify(filtered));
             } catch (e) {}
@@ -660,6 +719,7 @@ export default function AssistantPage() {
         const reader = response.body?.getReader();
         const decoder = new TextDecoder();
         let aiContent = '';
+        let skipAI = false;
         
         if (reader) {
           while (true) {
@@ -673,13 +733,18 @@ export default function AssistantPage() {
               if (line.startsWith('data: ')) {
                 try {
                   const data = JSON.parse(line.slice(6));
+
+                  if (data.skip) {
+                    skipAI = true;
+                    break;
+                  }
                   
                   if (data.content) {
                     // 逐步更新AI回复内容
                     aiContent += data.content;
                     setMessages((prev) => {
                       const updated = prev.map(m => 
-                        m.id === aiTempId ? { ...m, content: aiContent } : m
+                        m.id === aiMessageId ? { ...m, content: aiContent } : m
                       );
                       try {
                         localStorage.setItem(cacheKey, JSON.stringify(updated));
@@ -690,17 +755,23 @@ export default function AssistantPage() {
                   
                   if (data.done) {
                     // 流式响应完成，将AI消息入库
-                    const aiInsertResult = await supabase.from("messages").insert({
-                      conversation_id: conversationId,
-                      user_id: session.user.id,
-                      role: "assistant",
-                      content: aiContent,
-                    }).select().single();
+                    const aiInsertResult = await supabase
+                      .from("messages")
+                      .upsert({
+                        id: aiMessageId,
+                        client_message_id: aiMessageId,
+                        conversation_id: conversationId ?? undefined,
+                        user_id: session.user.id,
+                        role: "assistant",
+                        content: aiContent,
+                      }, { onConflict: "id" })
+                      .select()
+                      .single();
                     
                     if (aiInsertResult.data) {
                       const realAiMsg = aiInsertResult.data as Msg;
                       setMessages((prev) => {
-                        const updated = prev.map(m => m.id === aiTempId ? realAiMsg : m);
+                        const updated = prev.map(m => m.id === aiMessageId ? { ...m, ...realAiMsg } : m);
                         try {
                           localStorage.setItem(cacheKey, JSON.stringify(updated));
                         } catch (e) {}
@@ -714,28 +785,61 @@ export default function AssistantPage() {
                 }
               }
             }
+            if (skipAI) break;
           }
+        }
+        if (skipAI) {
+          setMessages((prev) => prev.filter(m => m.id !== aiMessageId));
+          return;
         }
       } catch (err) {
         console.error("AI voice reply error:", err);
         setError("AI 回复接口失败");
-        setMessages((prev) => prev.filter(m => m.id !== aiTempId));
+        setMessages((prev) => prev.filter(m => m.id !== aiMessageId));
       }
     } else if (session?.user) {
       // 上传失败，发送文本消息"[语音消息]"
-      const insertResult = await supabase.from("messages").insert({
-        conversation_id: conversationId,
-        user_id: session.user.id,
+      const cacheKey = `chat_messages_${conversationId}`;
+      const messageId = createMessageId();
+      const userMsg: Msg = {
+        id: messageId,
         role: "user",
         content: "[语音消息]",
-      }).select().single();
+        created_at: new Date().toISOString(),
+        conversation_id: conversationId ?? undefined,
+        user_id: session.user.id,
+        client_message_id: messageId,
+      };
       
-      // 立即添加到界面
+      setMessages((prev) => {
+        const updated = [...prev, userMsg];
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(updated));
+        } catch (e) {}
+        return updated;
+      });
+      
+      const insertResult = await supabase
+        .from("messages")
+        .upsert({
+          id: messageId,
+          client_message_id: messageId,
+          conversation_id: conversationId ?? undefined,
+          user_id: session.user.id,
+          role: "user",
+          content: "[语音消息]",
+        }, { onConflict: "id" })
+        .select()
+        .single();
+      
       if (insertResult.data) {
-        const userMsg = insertResult.data as Msg;
+        const realMsg = insertResult.data as Msg;
         setMessages((prev) => {
-          const filtered = prev.filter(m => m.id !== userMsg.id);
-          return [...filtered, userMsg];
+          const updated = prev.map(m => m.id === messageId ? { ...m, ...realMsg } : m);
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(updated));
+          } catch (e) {}
+          return updated;
         });
       }
       
@@ -748,7 +852,7 @@ export default function AssistantPage() {
           Authorization: session ? `Bearer ${session.access_token}` : "",
         },
         body: JSON.stringify({ 
-          conversation_id: conversationId, 
+          conversation_id: conversationId ?? undefined, 
           message: "[用户发送了语音消息]"
         }),
       }).catch(() => setError("AI 回复接口失败"));
@@ -853,19 +957,35 @@ export default function AssistantPage() {
         {messages.map((msg) => {
           const voice = parseVoice(msg);
           const isUserSide = msg.role === "user" || msg.role === "ai_voice";
+          const agentAvatar = msg.role === "agent" && msg.user_id ? agentAvatars[msg.user_id] : null;
           return (
             <div key={msg.id} className={`flex gap-2 ${isUserSide ? "justify-end" : "justify-start"} mb-3`}>
-              {/* AI头像（左侧） */}
+              {/* 头像（左侧） */}
               {!isUserSide && (
-                <div className="flex-shrink-0 w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-md">
-                  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <rect x="3" y="11" width="18" height="10" rx="2"/>
-                    <circle cx="12" cy="5" r="2"/>
-                    <path d="M12 7v4"/>
-                    <line x1="8" y1="16" x2="8" y2="16"/>
-                    <line x1="16" y1="16" x2="16" y2="16"/>
-                  </svg>
-                </div>
+                msg.role === "assistant" ? (
+                  // AI 消息 - 显示机器人头像
+                  <div className="flex-shrink-0 w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-md">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="11" width="18" height="10" rx="2"/>
+                      <circle cx="12" cy="5" r="2"/>
+                      <path d="M12 7v4"/>
+                      <line x1="8" y1="16" x2="8" y2="16"/>
+                      <line x1="16" y1="16" x2="16" y2="16"/>
+                    </svg>
+                  </div>
+                ) : msg.role === "agent" ? (
+                  // 客服消息 - 显示客服真实头像
+                  <div className="flex-shrink-0 w-9 h-9 rounded-full bg-green-500 flex items-center justify-center text-white shadow-md overflow-hidden">
+                    {agentAvatar ? (
+                      <img src={agentAvatar} alt="客服" className="w-full h-full object-cover" />
+                    ) : (
+                      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                        <circle cx="12" cy="7" r="4"/>
+                      </svg>
+                    )}
+                  </div>
+                ) : null
               )}
               
               <div

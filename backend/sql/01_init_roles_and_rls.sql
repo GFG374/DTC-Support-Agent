@@ -64,6 +64,8 @@ create table if not exists public.conversations (
     id uuid primary key default gen_random_uuid(),
     user_id uuid references auth.users(id) not null,
     title text,
+    status text default 'ai' check (status in ('ai', 'pending_agent', 'agent', 'closed')),
+    assigned_agent_id uuid references auth.users(id) on delete set null,
     created_at timestamptz default now()
 );
 alter table public.conversations enable row level security;
@@ -80,6 +82,7 @@ create policy "Users can update own conversations" on conversations for update u
 -- messages
 create table if not exists public.messages (
     id uuid primary key default gen_random_uuid(),
+    client_message_id uuid,
     conversation_id uuid references public.conversations(id) on delete cascade not null,
     user_id uuid references auth.users(id) not null,
     role text not null,
@@ -93,6 +96,10 @@ create policy "Users can select own messages" on messages for select using (auth
 
 drop policy if exists "Users can insert own messages" on messages;
 create policy "Users can insert own messages" on messages for insert with check (auth.uid() = user_id);
+
+create unique index if not exists messages_client_message_id_unique
+  on public.messages (client_message_id)
+  where client_message_id is not null;
 
 -- orders
 create table if not exists public.orders (
