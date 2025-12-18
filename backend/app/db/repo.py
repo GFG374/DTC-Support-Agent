@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,37 @@ class Repository:
     @staticmethod
     def _now() -> str:
         return datetime.utcnow().isoformat() + "Z"
+
+    @staticmethod
+    def _return_id_columns() -> List[str]:
+        return ["rma_id", "id"]
+
+    @staticmethod
+    def _return_user_columns() -> List[str]:
+        return ["usr_id", "user_id"]
+
+    @staticmethod
+    def _is_column_error(error: object) -> bool:
+        msg = str(error).lower()
+        return "column" in msg and "does not exist" in msg
+
+    @staticmethod
+    def _normalize_return_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return row
+        normalized = dict(row)
+        if "id" not in normalized and "rma_id" in normalized:
+            normalized["id"] = normalized["rma_id"]
+        if "user_id" not in normalized and "usr_id" in normalized:
+            normalized["user_id"] = normalized["usr_id"]
+        return normalized
+
+    @staticmethod
+    def _extract_missing_column(error: object) -> Optional[str]:
+        match = re.search(r'column "?([a-zA-Z0-9_]+)"? does not exist', str(error))
+        if match:
+            return match.group(1)
+        return None
 
     # Conversations -----------------------------------------------------------------
     def create_conversation(self, user_id: str, title: str = "Conversation") -> str:
@@ -131,15 +163,26 @@ class Repository:
     # Orders ------------------------------------------------------------------------
     def get_order(self, user_id: str, order_id: str) -> Optional[Dict[str, Any]]:
         if self.client:
-            res = (
+            order_res = (
                 self.client.table("orders")
-                .select("*, order_items(*)")
+                .select("*")
                 .eq("user_id", user_id)
-                .eq("id", order_id)
+                .eq("order_id", order_id)
                 .single()
                 .execute()
             )
-            return res.data
+            if not order_res.data:
+                return None
+            items_res = (
+                self.client.table("order_items")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("order_id", order_id)
+                .execute()
+            )
+            order = order_res.data
+            order["order_items"] = items_res.data or []
+            return order
         order = self.memory["orders"].get(order_id)
         if order and order["user_id"] == user_id:
             order["order_items"] = [
@@ -151,9 +194,13 @@ class Repository:
     def seed_mock_order(self, user_id: str) -> Dict[str, Any]:
         order_id = f"ORD-{str(uuid.uuid4())[:8]}"
         order = {
-            "id": order_id,
+            "order_id": order_id,
             "user_id": user_id,
             "status": "delivered",
+            "shipping_status": "delivered",
+            "paid_amount": 4900,
+            "currency": "CNY",
+            "tracking_no": None,
             "created_at": self._now(),
         }
         item_id = str(uuid.uuid4())
@@ -163,9 +210,9 @@ class Repository:
             "user_id": user_id,
             "sku": "SKU-001",
             "name": "Sample T-Shirt",
-            "price_cents": 4900,
-            "currency": "CNY",
-            "quantity": 1,
+            "category": "apparel",
+            "unit_price": 4900,
+            "qty": 1,
         }
         if self.client:
             order_res = self.client.table("orders").insert(order).execute()
@@ -185,9 +232,13 @@ class Repository:
         condition_ok: bool,
         requested_amount: int,
         status: str,
+        refund_id: Optional[str] = None,
+        refund_status: Optional[str] = None,
+        refund_amount: Optional[int] = None,
+        refund_error: Optional[str] = None,
+        refund_completed_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         record = {
-            "user_id": user_id,
             "order_id": order_id,
             "sku": sku,
             "reason": reason,
@@ -196,12 +247,88 @@ class Repository:
             "status": status,
             "created_at": self._now(),
         }
+        if refund_id is not None:
+            record["refund_id"] = refund_id
+        if refund_status is not None:
+            record["refund_status"] = refund_status
+        if refund_amount is not None:
+            record["refund_amount"] = refund_amount
+        if refund_error is not None:
+            record["refund_error"] = refund_error
+        if refund_completed_at is not None:
+            record["refund_completed_at"] = refund_completed_at
         if self.client:
-            res = self.client.table("returns").insert(record).execute()
-            return res.data[0]
+            return_id = str(uuid.uuid4())
+            last_error = None
+            for user_col in self._return_user_columns():
+                for id_col in self._return_id_columns():
+                    payload = dict(record)
+                    payload[user_col] = user_id
+                    payload[id_col] = return_id
+                    removed_columns = set()
+                    while True:
+                        res = self.client.table("returns").insert(payload).execute()
+                        if res.error:
+                            last_error = res.error
+                            missing = self._extract_missing_column(res.error)
+                            if self._is_column_error(res.error) and missing:
+                                if missing in (user_col, id_col):
+                                    break
+                                if missing in payload and missing not in removed_columns:
+                                    payload.pop(missing, None)
+                                    removed_columns.add(missing)
+                                    continue
+                            raise RuntimeError(str(res.error))
+                        return self._normalize_return_row(res.data[0]) or res.data[0]
+            if last_error:
+                raise RuntimeError(str(last_error))
+            raise RuntimeError("Failed to create return record")
         return_id = str(uuid.uuid4())
         record["id"] = return_id
+        record["user_id"] = user_id
         self.memory["returns"][return_id] = record
+        return record
+
+    def update_return(
+        self, user_id: str, return_id: str, updates: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        updates = dict(updates)
+        updates["updated_at"] = self._now()
+        if self.client:
+            last_error = None
+            for user_col in self._return_user_columns():
+                for id_col in self._return_id_columns():
+                    payload = dict(updates)
+                    removed_columns = set()
+                    while True:
+                        res = (
+                            self.client.table("returns")
+                            .update(payload)
+                            .eq(id_col, return_id)
+                            .eq(user_col, user_id)
+                            .execute()
+                        )
+                        if res.error:
+                            last_error = res.error
+                            missing = self._extract_missing_column(res.error)
+                            if self._is_column_error(res.error) and missing:
+                                if missing in (user_col, id_col):
+                                    break
+                                if missing in payload and missing not in removed_columns:
+                                    payload.pop(missing, None)
+                                    removed_columns.add(missing)
+                                    continue
+                            raise RuntimeError(str(res.error))
+                        if res.data:
+                            return self._normalize_return_row(res.data[0]) or res.data[0]
+                        break
+            if last_error:
+                raise RuntimeError(str(last_error))
+            raise ValueError("Return record not found or not owned by user")
+        record = self.memory["returns"].get(return_id)
+        if not record or record["user_id"] != user_id:
+            raise ValueError("Return record not found or not owned by user")
+        record.update(updates)
         return record
 
     def create_approval_task(

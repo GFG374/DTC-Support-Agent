@@ -1,94 +1,115 @@
-"""
-Order Agent - 订单查询部门
-负责查询订单详情和物流信息
-"""
+from __future__ import annotations
 
-from app.integrations.order import MockOrderAPI
+from datetime import datetime, timezone
+from typing import Optional
+
+from app.integrations.order import get_order_api
 
 
 class OrderAgent:
-    """订单部门 - 处理订单查询和物流查询"""
-    
-    def __init__(self):
-        self.order_api = MockOrderAPI()
-    
+    """Order department helper."""
+
+    def __init__(self, user_id: Optional[str] = None):
+        self.user_id = user_id
+        self.order_api = get_order_api()
+
     def get_order_details(self, order_id: str) -> dict:
-        """
-        获取订单详细信息
-        
-        Args:
-            order_id: 订单号
-            
-        Returns:
-            订单详情字典
-        """
-        order = self.order_api.get_order(order_id)
-        
+        order = self.order_api.get_order(order_id, user_id=self.user_id)
         if not order:
             return {
                 "success": False,
-                "error": f"订单 {order_id} 不存在"
+                "error": f"Order {order_id} not found",
             }
-        
+
+        items = order.get("items", order.get("order_items", [])) or []
+        paid_cents = order.get("paid_amount")
+        amount = (paid_cents or 0) / 100 if paid_cents is not None else None
+        created_at = order.get("created_at")
+        shipping_status = order.get("shipping_status")
+
         return {
             "success": True,
-            "order_id": order["order_id"],
-            "status": order["status"],
-            "status_cn": self._translate_status(order["status"]),
-            "amount": order["amount"],
-            "order_date": order["order_date"],
-            "products": order["products"],
-            "can_return": order["can_return"]
+            "order_id": order.get("order_id"),
+            "status": order.get("status"),
+            "shipping_status": shipping_status,
+            "status_cn": self._translate_status(order.get("status")),
+            "amount": amount,
+            "currency": order.get("currency"),
+            "order_date": created_at,
+            "products": [
+                {
+                    "name": item.get("name"),
+                    "quantity": item.get("qty"),
+                    "price": (item.get("unit_price") or 0) / 100 if item.get("unit_price") is not None else None,
+                    "sku": item.get("sku"),
+                }
+                for item in items
+            ],
+            "can_return": self._can_return(order),
         }
-    
+
     def get_logistics_info(self, order_id: str) -> dict:
-        """
-        获取物流跟踪信息
-        
-        Args:
-            order_id: 订单号
-            
-        Returns:
-            物流信息字典
-        """
-        logistics = self.order_api.get_logistics(order_id)
-        
+        logistics = self.order_api.get_logistics(order_id, user_id=self.user_id)
         if not logistics:
             return {
                 "success": False,
-                "error": f"订单 {order_id} 的物流信息不存在"
+                "error": f"Order {order_id} logistics not found",
             }
-        
-        # 美化物流状态
-        status_cn = self._translate_logistics_status(logistics["status"])
-        
+
+        status = logistics.get("status")
         return {
             "success": True,
-            "status": logistics["status"],
-            "status_cn": status_cn,
-            "carrier": logistics["carrier"],
-            "tracking_number": logistics["tracking_number"],
-            "current_location": logistics.get("current_location", "未知"),
-            "estimated_delivery": logistics.get("estimated_delivery", "查询中"),
-            "timeline": logistics.get("timeline", [])
+            "status": status,
+            "status_cn": self._translate_logistics_status(status),
+            "carrier": None,
+            "tracking_number": logistics.get("tracking_number"),
+            "timeline": [],
         }
-    
-    def _translate_status(self, status: str) -> str:
-        """翻译订单状态"""
+
+    def _can_return(self, order: dict) -> bool:
+        created_at = order.get("created_at")
+        if not created_at:
+            return False
+        created_dt = self._parse_dt(created_at)
+        if not created_dt:
+            return False
+        days = (datetime.now(timezone.utc) - created_dt).days
+        if days > 30:
+            return False
+        status = (order.get("status") or order.get("shipping_status") or "").lower()
+        return status not in {"cancelled", "refunded"}
+
+    @staticmethod
+    def _parse_dt(value: str) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _translate_status(status: Optional[str]) -> str:
+        if not status:
+            return "unknown"
         status_map = {
             "delivered": "已签收",
             "shipping": "运输中",
             "processing": "处理中",
-            "cancelled": "已取消"
+            "pending": "待发货",
+            "cancelled": "已取消",
+            "refunded": "已退款",
         }
-        return status_map.get(status, status)
-    
-    def _translate_logistics_status(self, status: str) -> str:
-        """翻译物流状态"""
+        key = status.lower()
+        return status_map.get(key, status)
+
+    @staticmethod
+    def _translate_logistics_status(status: Optional[str]) -> str:
+        if not status:
+            return "unknown"
         status_map = {
             "delivered": "已签收",
             "in_transit": "运输中",
             "picked_up": "已揽收",
-            "pending": "待发货"
+            "pending": "待发货",
         }
-        return status_map.get(status, status)
+        key = status.lower()
+        return status_map.get(key, status)

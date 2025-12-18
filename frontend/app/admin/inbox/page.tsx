@@ -1,5 +1,5 @@
 "use client";
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useMemo } from "react";
 import supabase from "@/lib/supabaseClient";
 import type { Session } from "@supabase/supabase-js";
 
@@ -53,6 +53,20 @@ type Profile = {
   role?: string | null;
 };
 
+type ReturnItem = {
+  id?: string;
+  rma_id?: string;
+  order_id?: string | null;
+  sku?: string | null;
+  reason?: string | null;
+  status?: string | null;
+  refund_status?: string | null;
+  refund_amount?: number | null;
+  requested_amount?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
 const parseVoice = (msg: Msg) => {
   let duration = msg.metadata?.duration || null;
   
@@ -78,6 +92,30 @@ const parseVoice = (msg: Msg) => {
   return null;
 };
 
+const formatMoney = (amount?: number | null) => {
+  if (amount === null || amount === undefined) return "--";
+  return `￥${(amount / 100).toFixed(2)}`;
+};
+
+const formatDate = (value?: string | null) => {
+  if (!value) return "--";
+  try {
+    return new Date(value).toLocaleString("zh-CN");
+  } catch {
+    return value;
+  }
+};
+
+const formatReturnStatus = (item: ReturnItem) => {
+  const raw = (item.refund_status || item.status || "").toLowerCase();
+  if (raw.includes("processing")) return "退款处理中";
+  if (raw.includes("success") || raw.includes("refunded")) return "退款成功";
+  if (raw.includes("failed")) return "退款失败";
+  if (raw.includes("awaiting") || raw.includes("pending")) return "等待审核";
+  if (raw.includes("rejected")) return "已拒绝";
+  return raw ? "售后处理中" : "暂无状态";
+};
+
 export default function InboxPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -85,10 +123,13 @@ export default function InboxPage() {
   const [currentAgentProfile, setCurrentAgentProfile] = useState<Profile | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [returnItems, setReturnItems] = useState<ReturnItem[]>([]);
+  const [returnsLoading, setReturnsLoading] = useState(false);
   const [input, setInput] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const activeConv = useMemo(() => conversations.find((c) => c.id === activeId), [conversations, activeId]);
 
   useEffect(() => {
     const handleClick = () => setContextMenu(null);
@@ -277,6 +318,38 @@ export default function InboxPage() {
   }, [session?.user, activeId, session?.access_token]);
 
   useEffect(() => {
+    if (!session?.access_token || !activeConv?.user_id) {
+      setReturnItems([]);
+      return;
+    }
+    let cancelled = false;
+    const loadReturns = async () => {
+      setReturnsLoading(true);
+      try {
+        const res = await fetch(`/api/admin/returns?user_id=${activeConv.user_id}`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        }).then((r) => r.json());
+        if (!cancelled) {
+          setReturnItems(Array.isArray(res.items) ? res.items : []);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setReturnItems([]);
+        }
+        console.error("load returns error", err);
+      } finally {
+        if (!cancelled) {
+          setReturnsLoading(false);
+        }
+      }
+    };
+    loadReturns();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.access_token, activeConv?.user_id]);
+
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
@@ -393,10 +466,15 @@ export default function InboxPage() {
             : c
         ));
         
-        const refreshed = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+        const refreshedRes = await fetch(`/api/admin/conversations/${activeId}/messages`, {
           headers: { Authorization: `Bearer ${session.access_token}` },
-        }).then((r) => r.json());
-        setMessages((refreshed.items as Msg[]) || []);
+        });
+        if (refreshedRes.ok) {
+          const refreshed = await refreshedRes.json();
+          if (Array.isArray(refreshed.items) && refreshed.items.length > 0) {
+            setMessages(refreshed.items as Msg[]);
+          }
+        }
         
         console.log("✅ 已接管对话:", result.agent_name);
       } else {
@@ -430,10 +508,15 @@ export default function InboxPage() {
         ));
         
         // 刷新消息列表
-        const refreshed = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+        const refreshedRes = await fetch(`/api/admin/conversations/${activeId}/messages`, {
           headers: { Authorization: `Bearer ${session.access_token}` },
-        }).then((r) => r.json());
-        setMessages((refreshed.items as Msg[]) || []);
+        });
+        if (refreshedRes.ok) {
+          const refreshed = await refreshedRes.json();
+          if (Array.isArray(refreshed.items) && refreshed.items.length > 0) {
+            setMessages(refreshed.items as Msg[]);
+          }
+        }
         
         console.log("✅ 已取消接管，AI 恢复工作");
       } else {
@@ -577,7 +660,6 @@ export default function InboxPage() {
     );
   };
 
-  const activeConv = conversations.find((c) => c.id === activeId);
   const activeProfile = activeId ? profiles[activeConv?.user_id || ""] : undefined;
 
   return (
@@ -772,24 +854,35 @@ export default function InboxPage() {
           </div>
         )}
 
-        <h4 className="text-xs font-bold text-gray-400 uppercase mb-4">当前订单</h4>
-        <div className="border border-gray-200 rounded-xl p-3">
-          <div className="flex gap-3 mb-2">
-            <div className="w-12 h-12 bg-gray-100 rounded flex items-center justify-center text-xl flex-shrink-0">🧥</div>
-            <div>
-              <div className="font-bold text-sm">高级羊绒大衣</div>
-              <div className="text-xs text-gray-500">¥899 • 黑色/L</div>
-            </div>
-          </div>
-          <div className="bg-yellow-50 text-yellow-700 text-xs p-2 rounded border border-yellow-100 mb-2">
-            ⚠️ 此商品属于高单价退货限制品类
-          </div>
-          <button className="w-full py-1.5 border border-gray-300 rounded text-xs font-medium hover:bg-gray-50">查看 Shopify 详情</button>
+        <h4 className="text-xs font-bold text-gray-400 uppercase mb-4">售后进度</h4>
+        <div className="space-y-3">
+          {returnsLoading && (
+            <div className="text-xs text-gray-400">售后记录加载中...</div>
+          )}
+          {!returnsLoading && returnItems.length === 0 && (
+            <div className="text-xs text-gray-400">暂无售后记录</div>
+          )}
+          {!returnsLoading &&
+            returnItems.map((item) => {
+              const returnId = item.rma_id || item.id || item.order_id || "return";
+              return (
+                <div key={returnId} className="border border-gray-200 rounded-xl p-3 bg-white">
+                  <div className="text-xs text-gray-500">订单 {item.order_id || "--"}</div>
+                  <div className="font-semibold text-sm text-gray-900 mt-1">
+                    {formatReturnStatus(item)}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">
+                    申请金额 {formatMoney(item.requested_amount ?? item.refund_amount)}
+                  </div>
+                  <div className="text-[11px] text-gray-400 mt-1">
+                    {formatDate(item.created_at)}
+                  </div>
+                </div>
+              );
+            })}
         </div>
       </div>
-
-      {/* 右键菜单 */}
-      {contextMenu && (
+{contextMenu && (
         <div
           className="fixed bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50 min-w-[140px]"
           style={{ top: contextMenu.y, left: contextMenu.x }}

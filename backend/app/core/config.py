@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     invite_code_pepper: str = ""
     invite_default_expires_hours: int = 72
     rate_limit_redeem_per_min: int = 5
+    alipay_app_id: str = ""
+    alipay_private_key: str = ""
+    alipay_public_key: str = ""
+    alipay_sandbox: bool = True
 
     class Config:
         env_file = ".env"
