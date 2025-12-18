@@ -65,6 +65,13 @@ const parseVoice = (msg: Msg) => {
   return null;
 };
 
+const formatSystemContent = (content: string) => {
+  if (content.startsWith("TRANSFER_TO_HUMAN:")) {
+    return "已为您转接人工客服，请稍候～";
+  }
+  return content;
+};
+
 export default function AssistantPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -955,6 +962,16 @@ export default function AssistantPage() {
           </div>
         )}
         {messages.map((msg) => {
+          if (msg.role === "system") {
+            const display = formatSystemContent(msg.content);
+            return (
+              <div key={msg.id} className="flex justify-center">
+                <div className="px-4 py-2 rounded-full text-xs font-medium bg-amber-50 text-amber-700 border border-amber-200 shadow-sm">
+                  {display}
+                </div>
+              </div>
+            );
+          }
           const voice = parseVoice(msg);
           const isUserSide = msg.role === "user" || msg.role === "ai_voice";
           const agentAvatar = msg.role === "agent" && msg.user_id ? agentAvatars[msg.user_id] : null;

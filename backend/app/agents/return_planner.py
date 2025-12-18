@@ -1,176 +1,202 @@
-"""
-Return Planner Agent - 退货处理部门
-负责检查退货政策、处理退款、生成 RMA
-"""
+﻿from __future__ import annotations
 
-from datetime import datetime, timedelta
-from app.integrations.order import MockOrderAPI
-from app.integrations.alipay import MockAlipayClient
+from datetime import datetime, timezone
+from typing import Optional
 import random
+import time
+
+from app.db.repo import Repository
+from app.integrations.alipay import get_alipay_client
+from app.integrations.order import get_order_api
 
 
 class ReturnPlannerAgent:
-    """退货部门 - 处理退货退款请求"""
-    
-    def __init__(self):
-        self.order_api = MockOrderAPI()
-        self.alipay_client = MockAlipayClient()
-        
+    """Return policy helper."""
+
+    def __init__(self, user_id: Optional[str] = None, repo: Optional[Repository] = None):
+        self.user_id = user_id
+        self.order_api = get_order_api()
+        self.repo = repo or Repository.from_env()
+        self.alipay_client = get_alipay_client(use_mock=False)
+
     def check_return_policy(self, order_id: str) -> dict:
-        """
-        检查订单是否符合退货政策
-        
-        规则：
-        - 30天内可退（从签收日期算）
-        - 金额 > 200 需要主管审批
-        
-        Returns:
-            {
-                "eligible": bool,  # 是否符合政策
-                "reason": str,     # 原因
-                "order": dict      # 订单信息
-            }
-        """
-        # 获取订单信息
-        order = self.order_api.get_order(order_id)
-        
+        order = self.order_api.get_order(order_id, user_id=self.user_id)
         if not order:
             return {
                 "eligible": False,
-                "reason": f"订单 {order_id} 不存在",
-                "order": None
+                "reason": f"Order {order_id} not found",
+                "order": None,
             }
-        
-        # 检查订单状态（只有已签收的才能退）
-        if order["status"] != "delivered":
+
+        status = (order.get("status") or "").lower()
+        shipping_status = (order.get("shipping_status") or "").lower()
+        if status not in {"delivered", "completed"} and shipping_status != "delivered":
             return {
                 "eligible": False,
-                "reason": f"订单状态为 {order['status']}，只有已签收的订单才能退货",
-                "order": order
-            }
-        
-        # 检查退货时间窗口（30天）
-        order_date = datetime.strptime(order["order_date"], "%Y-%m-%d")
-        days_since_order = (datetime.now() - order_date).days
-        
-        if days_since_order > 30:
-            return {
-                "eligible": False,
-                "reason": f"订单已超过30天退货期限（已过{days_since_order}天）",
+                "reason": f"Order status is {status or shipping_status}",
                 "order": order,
-                "suggestion": "如有特殊情况，建议联系人工客服"
             }
-        
-        # 检查金额（>200 需要审批）
-        if order["amount"] > 200:
+
+        created_at = order.get("created_at")
+        created_dt = self._parse_dt(created_at)
+        if not created_dt:
+            return {
+                "eligible": False,
+                "reason": "Order date missing",
+                "order": order,
+            }
+
+        days_since = (datetime.now(timezone.utc) - created_dt).days
+        if days_since > 30:
+            return {
+                "eligible": False,
+                "reason": f"Return window expired ({days_since} days)",
+                "order": order,
+                "suggestion": "Contact support for exceptions",
+            }
+
+        amount_cents = order.get("paid_amount") or 0
+        amount_major = amount_cents / 100 if amount_cents else 0
+        if amount_major > 200:
             return {
                 "eligible": True,
                 "need_approval": True,
-                "reason": f"订单金额 {order['amount']} 元超过200元，需要主管审批",
-                "order": order
+                "reason": f"Amount {amount_major:.2f} exceeds approval threshold",
+                "order": order,
             }
-        
-        # 符合退货政策
+
         return {
             "eligible": True,
             "need_approval": False,
-            "reason": "符合30天退货政策",
-            "order": order
+            "reason": "Return policy eligible",
+            "order": order,
         }
-    
-    def process_refund(self, order_id: str, amount: float, reason: str = "用户申请退款") -> dict:
-        """
-        处理退款（调用支付宝 API）
-        
-        Args:
-            order_id: 订单号
-            amount: 退款金额
-            reason: 退款原因
-            
-        Returns:
-            退款结果
-        """
-        # 调用支付宝退款 API
-        refund_result = self.alipay_client.refund(
-            out_trade_no=order_id,
-            refund_amount=amount,
-            refund_reason=reason
+
+    async def process_refund(self, order_id: str, amount: float, reason: str, refund_id: str) -> dict:
+        return await self.alipay_client.refund(
+            order_id=order_id,
+            amount=amount,
+            reason=reason,
+            refund_id=refund_id,
         )
-        
-        return refund_result
-    
+
     def generate_rma_number(self) -> str:
-        """
-        生成退货授权码（RMA）
-        
-        Returns:
-            RMA 号码（格式：RMA + 日期 + 随机数）
-        """
         today = datetime.now().strftime("%Y%m%d")
-        random_num = random.randint(100, 999)
-        return f"RMA{today}{random_num}"
-    
-    def handle_return_request(self, order_id: str, reason: str = "用户申请退货") -> dict:
-        """
-        完整处理退货请求（供 Q&A Agent 调用）
-        
-        工作流程：
-        1. 检查退货政策
-        2. 如果符合 + 不需要审批 → 自动退款 + 生成 RMA
-        3. 如果符合 + 需要审批 → 提交审批流程
-        4. 如果不符合 → 返回拒绝理由
-        
-        Returns:
-            完整的处理结果（格式化后直接给前台）
-        """
-        # Step 1: 检查政策
+        return f"RMA{today}{random.randint(100, 999)}"
+
+    async def handle_return_request(self, order_id: str, reason: str = "user_requested") -> dict:
         policy_check = self.check_return_policy(order_id)
-        
-        # 不符合退货政策
-        if not policy_check["eligible"]:
+        if not policy_check.get("eligible"):
+            if self.user_id:
+                self.repo.create_return(
+                    user_id=self.user_id,
+                    order_id=order_id,
+                    sku="",
+                    reason=reason,
+                    condition_ok=False,
+                    requested_amount=0,
+                    status="rejected",
+                )
             return {
                 "approved": False,
-                "reason": policy_check["reason"],
-                "suggestion": policy_check.get("suggestion", "请联系人工客服")
+                "reason": policy_check.get("reason"),
+                "suggestion": policy_check.get("suggestion", "Contact support"),
             }
-        
-        order = policy_check["order"]
-        
-        # 需要主管审批
+
+        order = policy_check.get("order") or {}
+        amount_cents = order.get("paid_amount") or 0
+        amount_major = amount_cents / 100 if amount_cents else 0
+
         if policy_check.get("need_approval"):
+            if self.user_id:
+                self.repo.create_return(
+                    user_id=self.user_id,
+                    order_id=order_id,
+                    sku="",
+                    reason=reason,
+                    condition_ok=True,
+                    requested_amount=amount_cents,
+                    status="awaiting_approval",
+                )
             return {
                 "approved": False,
                 "action": "need_approval",
-                "reason": policy_check["reason"],
+                "reason": policy_check.get("reason"),
                 "order_id": order_id,
-                "amount": order["amount"],
-                "next_step": "已提交审批流程，预计1个工作日内回复"
+                "amount": amount_major,
+                "next_step": "Approval required",
             }
-        
-        # Step 2: 符合政策，自动退款
-        refund_result = self.process_refund(
-            order_id=order_id,
-            amount=order["amount"],
-            reason=reason
+
+        return_record = None
+        if self.user_id:
+            return_record = self.repo.create_return(
+                user_id=self.user_id,
+                order_id=order_id,
+                sku="",
+                reason=reason,
+                condition_ok=True,
+                requested_amount=amount_cents,
+                status="refund_processing",
+                refund_status="processing",
+                refund_amount=amount_cents,
+            )
+
+        refund_id = (
+            return_record.get("id") or return_record.get("rma_id")
+            if return_record
+            else f"REFUND_{int(time.time())}"
         )
-        
-        # Step 3: 生成 RMA
+        refund_result = await self.process_refund(
+            order_id=order_id,
+            amount=amount_major,
+            reason=reason,
+            refund_id=refund_id,
+        )
+
+        if self.user_id and return_record:
+            if refund_result.get("success"):
+                self.repo.update_return(
+                    user_id=self.user_id,
+                    return_id=return_record.get("id") or return_record.get("rma_id"),
+                    updates={
+                        "refund_id": refund_result.get("refund_id", refund_id),
+                        "refund_status": "success",
+                        "status": "refunded",
+                        "refund_completed_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            else:
+                self.repo.update_return(
+                    user_id=self.user_id,
+                    return_id=return_record.get("id") or return_record.get("rma_id"),
+                    updates={
+                        "refund_id": refund_id,
+                        "refund_status": "failed",
+                        "status": "refund_failed",
+                        "refund_error": refund_result.get("error"),
+                    },
+                )
+
         rma_number = self.generate_rma_number()
-        
-        # Step 4: 返回成功结果
+
         return {
-            "approved": True,
+            "approved": refund_result.get("success", False),
             "action": "auto_refund",
             "order_id": order_id,
-            "refund_amount": order["amount"],
-            "refund_id": refund_result.get("trade_no", "MOCK_REFUND_ID"),
+            "refund_amount": amount_major,
+            "refund_id": refund_result.get("refund_id", refund_id),
             "rma_number": rma_number,
             "days": "3-5",
-            "message": f"退款 {order['amount']} 元已提交，3-5个工作日内到账",
-            "return_address": "北京市朝阳区 DSW 退货中心（邮编：100020）",
-            "next_steps": [
-                f"请在包裹上标注 RMA 号码：{rma_number}",
-                "将商品寄回退货中心",
-                "退款将在收到商品后3-5个工作日内原路退回"
-            ]
+            "message": "Refund submitted" if refund_result.get("success") else "Refund failed",
+            "return_address": "Return Center",
+            "refund_status": "success" if refund_result.get("success") else "failed",
         }
+
+    @staticmethod
+    def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None

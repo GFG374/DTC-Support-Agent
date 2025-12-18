@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+﻿from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
@@ -47,50 +47,39 @@ async def assign_conversation(
     user: User = Depends(require_admin),
 ):
     """
-    客服接管对话
-    将 conversation status 更新为 'agent'，设置 assigned_agent_id
+    人工接管对话：把 conversations.status 更新为 agent，并写入 assigned_agent_id。
     """
-    # 验证用户角色（只有 admin 可以接管）
-    
     client = get_supabase_admin_client()
-    
-    # 检查对话是否存在
+
     conv_response = client.table("conversations").select("*").eq("id", conversation_id).execute()
     if not conv_response.data or len(conv_response.data) == 0:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    
+
     conversation = conv_response.data[0]
-    
-    # 检查对话状态是否为 pending_agent
-    if conversation.get("status") != "pending_agent":
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Conversation is not pending agent (current status: {conversation.get('status')})"
-        )
-    
-    # 更新对话状态
-    update_response = client.table("conversations").update({
+
+    # 更新会话状态为人工接管
+    client.table("conversations").update({
         "status": "agent",
         "assigned_agent_id": user.user_id
     }).eq("id", conversation_id).execute()
-    
-    # 获取客服名称
+
+    # 获取客服昵称
     profile_response = client.table("user_profiles").select("display_name").eq("user_id", user.user_id).execute()
     agent_name = "客服"
     if profile_response.data and len(profile_response.data) > 0:
         agent_name = profile_response.data[0].get("display_name", "客服")
-    
-    # 添加系统消息：客服已接入
-    system_message = f"✅ 客服「{agent_name}」已接入，为您服务"
+
+    # 推送系统消息，提示客服已接入
+    system_message = f"客服「{agent_name}」已接入，为您服务"
     customer_id = conversation.get("user_id")
-    
+
     client.table("messages").insert({
         "conversation_id": conversation_id,
         "user_id": customer_id,
         "role": "system",
         "content": system_message
     }).execute()
-    
+
     return {
         "ok": True,
         "conversation_id": conversation_id,
@@ -107,50 +96,49 @@ async def release_conversation(
     user: User = Depends(require_admin),
 ):
     """
-    客服解除接管对话
-    将 conversation status 从 'agent' 更新为 'ai'，AI 恢复工作
+    客服解除接管对话：
+    conversation status 从 'agent' 更新为 'ai'，AI 恢复工作
     """
-    # 验证用户角色（只有 admin 可以操作）
-    
+    # 验证用户角色（仅 admin 可操作）
     client = get_supabase_admin_client()
-    
+
     # 检查对话是否存在
     conv_response = client.table("conversations").select("*").eq("id", conversation_id).execute()
     if not conv_response.data or len(conv_response.data) == 0:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    
+
     conversation = conv_response.data[0]
-    
+
     # 检查是否是当前客服接管的对话
     if conversation.get("assigned_agent_id") != user.user_id:
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail="You can only release conversations assigned to you"
         )
-    
+
     # 更新对话状态为 AI 接管
-    update_response = client.table("conversations").update({
+    client.table("conversations").update({
         "status": "ai",
         "assigned_agent_id": None
     }).eq("id", conversation_id).execute()
-    
+
     # 获取客服名称
     profile_response = client.table("user_profiles").select("display_name").eq("user_id", user.user_id).execute()
     agent_name = "客服"
     if profile_response.data and len(profile_response.data) > 0:
         agent_name = profile_response.data[0].get("display_name", "客服")
-    
+
     # 添加系统消息：AI 恢复服务
-    system_message = f"🤖 客服「{agent_name}」已解除接管，AI 恢复为您服务"
+    system_message = f"客服「{agent_name}」已解除接管，AI 恢复为您服务"
     customer_id = conversation.get("user_id")
-    
+
     client.table("messages").insert({
         "conversation_id": conversation_id,
         "user_id": customer_id,
         "role": "system",
         "content": system_message
     }).execute()
-    
+
     return {
         "ok": True,
         "conversation_id": conversation_id,
@@ -165,16 +153,16 @@ async def get_conversation_status(
     user: User = Depends(get_current_user),
 ):
     """
-    获取对话状态（用于检查是否被人工接管）
+    获取对话状态（用于检查是否被人工接管）。
     """
     client = get_supabase_admin_client()
-    
+
     conv_response = client.table("conversations").select("status, assigned_agent_id").eq("id", conversation_id).execute()
     if not conv_response.data or len(conv_response.data) == 0:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    
+
     conversation = conv_response.data[0]
-    
+
     return {
         "conversation_id": conversation_id,
         "status": conversation.get("status", "ai"),

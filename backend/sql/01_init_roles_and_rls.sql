@@ -101,13 +101,40 @@ create unique index if not exists messages_client_message_id_unique
   on public.messages (client_message_id)
   where client_message_id is not null;
 
--- orders
 create table if not exists public.orders (
-    id text primary key,
+    order_id text primary key,
     user_id uuid references auth.users(id) not null,
+    created_at timestamptz default now(),
+    paid_amount int,
+    currency text,
     status text,
-    created_at timestamptz default now()
+    shipping_status text,
+    tracking_no text
 );
+
+-- Legacy column rename to keep backward compatibility
+do $$
+begin
+    if exists (
+        select 1 from information_schema.columns
+        where table_name = 'orders' and column_name = 'id'
+    ) and not exists (
+        select 1 from information_schema.columns
+        where table_name = 'orders' and column_name = 'order_id'
+    ) then
+        alter table public.orders rename column id to order_id;
+    end if;
+end $$;
+
+alter table public.orders alter column order_id set not null;
+alter table public.orders drop constraint if exists orders_pkey;
+alter table public.orders add constraint orders_pkey primary key (order_id);
+
+alter table public.orders add column if not exists paid_amount int;
+alter table public.orders add column if not exists currency text;
+alter table public.orders add column if not exists shipping_status text;
+alter table public.orders add column if not exists tracking_no text;
+
 alter table public.orders enable row level security;
 
 drop policy if exists "Users can select own orders" on orders;
@@ -116,26 +143,54 @@ create policy "Users can select own orders" on orders for select using (auth.uid
 -- order_items
 create table if not exists public.order_items (
     id text primary key,
-    order_id text references public.orders(id) on delete cascade not null,
+    order_id text references public.orders(order_id) on delete cascade not null,
     sku text,
     name text,
-    price_cents int,
-    currency text,
-    quantity int
+    category text,
+    qty int,
+    unit_price int,
+    user_id uuid references auth.users(id)
 );
--- Add user_id if it doesn't exist (handling existing table case)
+
+alter table public.order_items add column if not exists user_id uuid references auth.users(id);
+alter table public.order_items add column if not exists category text;
+alter table public.order_items add column if not exists qty int;
+alter table public.order_items add column if not exists unit_price int;
+
 do $$
 begin
-    if not exists (select 1 from information_schema.columns where table_name = 'order_items' and column_name = 'user_id') then
-        alter table public.order_items add column user_id uuid references auth.users(id);
+    if exists (
+        select 1 from information_schema.columns
+        where table_name = 'order_items' and column_name = 'quantity'
+    ) and not exists (
+        select 1 from information_schema.columns
+        where table_name = 'order_items' and column_name = 'qty'
+    ) then
+        alter table public.order_items rename column quantity to qty;
+    end if;
+    if exists (
+        select 1 from information_schema.columns
+        where table_name = 'order_items' and column_name = 'price_cents'
+    ) and not exists (
+        select 1 from information_schema.columns
+        where table_name = 'order_items' and column_name = 'unit_price'
+    ) then
+        alter table public.order_items rename column price_cents to unit_price;
     end if;
 end $$;
+
+alter table public.order_items drop constraint if exists order_items_order_id_fkey;
+alter table public.order_items
+    add constraint order_items_order_id_fkey foreign key (order_id)
+    references public.orders(order_id) on delete cascade;
 
 -- Enforce RLS on order_items
 alter table public.order_items enable row level security;
 
 drop policy if exists "Users can select own order_items" on order_items;
 create policy "Users can select own order_items" on order_items for select using (auth.uid() = user_id);
+drop policy if exists "Users can insert own order_items" on order_items;
+create policy "Users can insert own order_items" on order_items for insert with check (auth.uid() = user_id);
 
 -- returns
 create table if not exists public.returns (

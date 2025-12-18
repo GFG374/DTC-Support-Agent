@@ -1,10 +1,12 @@
 import re
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from ..agents import qa
 from ..db.repo import Repository
 from ..rag import bailian
+from ..integrations.alipay import get_alipay_client
 from ..rules import returns as return_rules
 
 
@@ -74,21 +76,22 @@ class ReturnFlow:
             reply = qa.render_return_result("rejected")
             return reply, {"state": "RuleCheck", "decision": ctx.decision, "rules": rules}
 
-        ctx.decision = (
-            "awaiting_approval"
-            if rules["needs_approval"]
-            else "auto_refund"
-        )
+        ctx.decision = "awaiting_approval" if rules["needs_approval"] else "auto_refund"
+        refund_amount_cents = ctx.requested_amount or order.get("paid_amount") or 0
+        refund_amount_major = refund_amount_cents / 100 if refund_amount_cents else 0
+
         return_record = self.repo.create_return(
             user_id=user_id,
             order_id=ctx.order_id,
             sku=ctx.sku or "",
             reason=ctx.reason or "unspecified",
             condition_ok=ctx.condition_ok is not False,
-            requested_amount=ctx.requested_amount or 0,
-            status="awaiting_approval" if rules["needs_approval"] else "refunded",
+            requested_amount=refund_amount_cents,
+            status="awaiting_approval" if rules["needs_approval"] else "refund_processing",
+            refund_status="processing" if not rules["needs_approval"] else None,
+            refund_amount=refund_amount_cents if not rules["needs_approval"] else None,
         )
-        ctx.return_id = return_record.get("id")
+        ctx.return_id = return_record.get("id") or return_record.get("rma_id")
 
         if rules["needs_approval"]:
             approval = self.repo.create_approval_task(
@@ -104,6 +107,40 @@ class ReturnFlow:
                 conversation_id=conversation_id,
                 user_id=user_id,
             )
+        else:
+            alipay_client = get_alipay_client(use_mock=False)
+            try:
+                refund_result = await alipay_client.refund(
+                    order_id=ctx.order_id or "",
+                    amount=refund_amount_major,
+                    reason=ctx.reason or "user_requested",
+                    refund_id=ctx.return_id,
+                )
+            except Exception as exc:
+                refund_result = {"success": False, "error": str(exc)}
+
+            if refund_result.get("success"):
+                self.repo.update_return(
+                    user_id=user_id,
+                    return_id=ctx.return_id or "",
+                    updates={
+                        "refund_id": refund_result.get("refund_id", ctx.return_id),
+                        "refund_status": "success",
+                        "status": "refunded",
+                        "refund_completed_at": datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+            else:
+                self.repo.update_return(
+                    user_id=user_id,
+                    return_id=ctx.return_id or "",
+                    updates={
+                        "refund_id": ctx.return_id,
+                        "refund_status": "failed",
+                        "status": "refund_failed",
+                        "refund_error": refund_result.get("error"),
+                    },
+                )
 
         reply = qa.render_return_result(ctx.decision, ctx.approval_task_id or "")
         return reply, {
