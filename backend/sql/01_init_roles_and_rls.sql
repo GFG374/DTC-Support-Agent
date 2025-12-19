@@ -87,6 +87,9 @@ create table if not exists public.messages (
     user_id uuid references auth.users(id) not null,
     role text not null,
     content text not null,
+    metadata jsonb,
+    audio_url text,
+    transcript text,
     created_at timestamptz default now()
 );
 alter table public.messages enable row level security;

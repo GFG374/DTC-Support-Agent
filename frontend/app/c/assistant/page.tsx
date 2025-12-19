@@ -4,6 +4,25 @@ import { useEffect, useRef, useState } from "react";
 import supabase from "@/lib/supabaseClient";
 import type { Session } from "@supabase/supabase-js";
 import { WavRecorder } from "@/lib/wavRecorder";
+import OrderCards from "@/components/c/OrderCards";
+
+type OrderData = {
+  order_id: string;
+  status?: string;
+  status_cn?: string;
+  shipping_status?: string;
+  shipping_status_cn?: string;
+  amount?: number;
+  currency?: string;
+  order_date?: string;
+  products?: Array<{
+    name?: string;
+    quantity?: number;
+    price?: number;
+    sku?: string;
+  }>;
+  can_return?: boolean;
+};
 
 type Msg = {
   id: string;
@@ -14,14 +33,20 @@ type Msg = {
   client_message_id?: string;
   audio_url?: string | null;
   transcript?: string | null;
-  metadata?: { duration?: number } | null;
+  metadata?: { duration?: number; orders?: OrderData[] } | null;
   user_id?: string;
+  orders?: OrderData[];
 };
 
 // 只去重，不排序（保持添加顺序）
+// 同时从 metadata 中提取 orders
 const dedupe = (arr: Msg[]) => {
   const map = new Map<string, Msg>();
-  arr.forEach((m) => map.set(m.id, m));
+  arr.forEach((m) => {
+    // 从 metadata 中提取 orders 数据
+    const orders = m.orders || m.metadata?.orders;
+    map.set(m.id, { ...m, orders });
+  });
   return Array.from(map.values());
 };
 
@@ -84,8 +109,11 @@ export default function AssistantPage() {
   const [isCanceling, setIsCanceling] = useState(false);
   const [voiceMode, setVoiceMode] = useState(false);
   const [userProfile, setUserProfile] = useState<{ display_name?: string; avatar_url?: string } | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl?: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
+  // 多选模式
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // 客服头像缓存：user_id -> avatar_url
   const [agentAvatars, setAgentAvatars] = useState<Record<string, string | null>>({});
   const wavRecorderRef = useRef<WavRecorder | null>(null);
@@ -94,6 +122,76 @@ export default function AssistantPage() {
   const touchStartYRef = useRef<number>(0);
   const isCancelingRef = useRef(false);
   const recordingTimeRef = useRef(0);
+
+  // 关闭右键菜单的全局监听
+  useEffect(() => {
+    const handleClick = () => setContextMenu(null);
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, []);
+
+  // 删除单条消息
+  const handleDeleteMessage = async (messageId: string) => {
+    if (!session?.access_token) return;
+    try {
+      const { error } = await supabase.from("messages").delete().eq("id", messageId);
+      if (error) throw error;
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+      const cacheKey = `messages_${conversationId}`;
+      setMessages(prev => {
+        try { localStorage.setItem(cacheKey, JSON.stringify(prev.filter(m => m.id !== messageId))); } catch {}
+        return prev;
+      });
+    } catch (err) {
+      console.error("删除消息失败", err);
+      setError("删除消息失败");
+    }
+    setContextMenu(null);
+  };
+
+  // 批量删除消息
+  const handleDeleteSelected = async () => {
+    if (!session?.access_token || selectedIds.size === 0) return;
+    try {
+      const ids = Array.from(selectedIds);
+      const { error } = await supabase.from("messages").delete().in("id", ids);
+      if (error) throw error;
+      setMessages(prev => {
+        const filtered = prev.filter(m => !selectedIds.has(m.id));
+        const cacheKey = `messages_${conversationId}`;
+        try { localStorage.setItem(cacheKey, JSON.stringify(filtered)); } catch {}
+        return filtered;
+      });
+      setSelectedIds(new Set());
+      setSelectMode(false);
+    } catch (err) {
+      console.error("批量删除失败", err);
+      setError("批量删除失败");
+    }
+  };
+
+  // 切换选中状态
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 进入多选模式
+  const enterSelectMode = (firstId?: string) => {
+    setSelectMode(true);
+    if (firstId) setSelectedIds(new Set([firstId]));
+    setContextMenu(null);
+  };
+
+  // 退出多选模式
+  const exitSelectMode = () => {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  };
 
   // 关闭右键菜单的全局监听
   useEffect(() => {
@@ -199,7 +297,9 @@ export default function AssistantPage() {
         (payload) => {
           if (!isMounted) return;
           
-          const newRow = payload.new as Msg;
+          const rawRow = payload.new as Msg;
+          // 从 metadata 提取 orders 数据
+          const newRow = { ...rawRow, orders: rawRow.orders || rawRow.metadata?.orders };
           
           // 严格去重
           if (loadedMsgIds.has(newRow.id)) return;
@@ -335,16 +435,19 @@ export default function AssistantPage() {
     
     try {
       // 2. Persist user message with client ID
+      const messageData: any = {
+        id: messageId,
+        client_message_id: messageId,
+        user_id: session.user.id,
+        role: "user",
+        content: text,
+      };
+      if (conversationId) {
+        messageData.conversation_id = conversationId;
+      }
       const insertResult = await supabase
         .from("messages")
-        .upsert({
-          id: messageId,
-          client_message_id: messageId,
-          conversation_id: conversationId ?? undefined,
-          user_id: session.user.id,
-          role: "user",
-          content: text,
-        }, { onConflict: "id" })
+        .upsert(messageData)
         .select()
         .single();
       
@@ -417,6 +520,7 @@ export default function AssistantPage() {
       const decoder = new TextDecoder();
       let aiContent = '';
       let skipAI = false;
+      let orderData: OrderData[] = [];
       
       if (reader) {
         while (true) {
@@ -435,12 +539,24 @@ export default function AssistantPage() {
                   skipAI = true;
                   break;
                 }
+
+                // 处理 tool_data（订单数据）
+                if (data.tool_data?.orders) {
+                  orderData = data.tool_data.orders;
+                  // 立即更新消息以显示订单卡片
+                  setMessages((prev) => {
+                    const updated = prev.map(m => 
+                      m.id === aiMessageId ? { ...m, orders: orderData } : m
+                    );
+                    return updated;
+                  });
+                }
                 
                 if (data.content) {
                   aiContent += data.content;
                   setMessages((prev) => {
                     const updated = prev.map(m => 
-                      m.id === aiMessageId ? { ...m, content: aiContent } : m
+                      m.id === aiMessageId ? { ...m, content: aiContent, orders: orderData.length > 0 ? orderData : m.orders } : m
                     );
                     try {
                       localStorage.setItem(cacheKey, JSON.stringify(updated));
@@ -450,23 +566,31 @@ export default function AssistantPage() {
                 }
                 
                 if (data.done) {
+                  // 保存消息到数据库，包含订单数据到 metadata
+                  const messageData: any = {
+                    id: aiMessageId,
+                    client_message_id: aiMessageId,
+                    user_id: session.user.id,
+                    role: "assistant",
+                    content: aiContent,
+                  };
+                  if (conversationId) {
+                    messageData.conversation_id = conversationId;
+                  }
+                  if (orderData.length > 0) {
+                    messageData.metadata = { orders: orderData };
+                  }
                   const aiInsertResult = await supabase
                     .from("messages")
-                    .upsert({
-                      id: aiMessageId,
-                      client_message_id: aiMessageId,
-                      conversation_id: conversationId ?? undefined,
-                      user_id: session.user.id,
-                      role: "assistant",
-                      content: aiContent,
-                    }, { onConflict: "id" })
+                    .upsert(messageData)
                     .select()
                     .single();
                   
                   if (aiInsertResult.data) {
                     const realAiMsg = aiInsertResult.data as Msg;
+                    // 保留订单数据
                     setMessages((prev) => {
-                      const updated = prev.map(m => m.id === aiMessageId ? { ...m, ...realAiMsg } : m);
+                      const updated = prev.map(m => m.id === aiMessageId ? { ...m, ...realAiMsg, orders: orderData.length > 0 ? orderData : m.orders } : m);
                       try {
                         localStorage.setItem(cacheKey, JSON.stringify(updated));
                       } catch (e) {}
@@ -626,17 +750,20 @@ export default function AssistantPage() {
       });
       
       // Persist voice message
+      const voiceData: any = {
+        id: messageId,
+        client_message_id: messageId,
+        user_id: session.user.id,
+        role: "user",
+        content: `[语音 ${duration}秒]`,
+        audio_url: publicUrl,
+      };
+      if (conversationId) {
+        voiceData.conversation_id = conversationId;
+      }
       const insertResult = await supabase
         .from("messages")
-        .upsert({
-          id: messageId,
-          client_message_id: messageId,
-          conversation_id: conversationId ?? undefined,
-          user_id: session.user.id,
-          role: "user",
-          content: `[语音 ${duration}秒]`,
-          audio_url: publicUrl,
-        }, { onConflict: "id" })
+        .upsert(voiceData)
         .select()
         .single();
 
@@ -762,16 +889,19 @@ export default function AssistantPage() {
                   
                   if (data.done) {
                     // 流式响应完成，将AI消息入库
+                    const aiData: any = {
+                      id: aiMessageId,
+                      client_message_id: aiMessageId,
+                      user_id: session.user.id,
+                      role: "assistant",
+                      content: aiContent,
+                    };
+                    if (conversationId) {
+                      aiData.conversation_id = conversationId;
+                    }
                     const aiInsertResult = await supabase
                       .from("messages")
-                      .upsert({
-                        id: aiMessageId,
-                        client_message_id: aiMessageId,
-                        conversation_id: conversationId ?? undefined,
-                        user_id: session.user.id,
-                        role: "assistant",
-                        content: aiContent,
-                      }, { onConflict: "id" })
+                      .upsert(aiData)
                       .select()
                       .single();
                     
@@ -826,16 +956,19 @@ export default function AssistantPage() {
         return updated;
       });
       
+      const placeholderData: any = {
+        id: messageId,
+        client_message_id: messageId,
+        user_id: session.user.id,
+        role: "user",
+        content: "[语音消息]",
+      };
+      if (conversationId) {
+        placeholderData.conversation_id = conversationId;
+      }
       const insertResult = await supabase
         .from("messages")
-        .upsert({
-          id: messageId,
-          client_message_id: messageId,
-          conversation_id: conversationId ?? undefined,
-          user_id: session.user.id,
-          role: "user",
-          content: "[语音消息]",
-        }, { onConflict: "id" })
+        .upsert(placeholderData)
         .select()
         .single();
       
@@ -975,8 +1108,28 @@ export default function AssistantPage() {
           const voice = parseVoice(msg);
           const isUserSide = msg.role === "user" || msg.role === "ai_voice";
           const agentAvatar = msg.role === "agent" && msg.user_id ? agentAvatars[msg.user_id] : null;
+          const isSelected = selectedIds.has(msg.id);
           return (
-            <div key={msg.id} className={`flex gap-2 ${isUserSide ? "justify-end" : "justify-start"} mb-3`}>
+            <div 
+              key={msg.id} 
+              className={`flex gap-2 ${isUserSide ? "justify-end" : "justify-start"} mb-3 ${selectMode ? 'cursor-pointer' : ''}`}
+              onClick={() => selectMode && toggleSelect(msg.id)}
+              onContextMenu={(e) => {
+                if (selectMode) return;
+                e.preventDefault();
+                setContextMenu({ x: e.clientX, y: e.clientY, messageId: msg.id, audioUrl: voice?.url || undefined });
+              }}
+            >
+              {/* 多选模式下的复选框 */}
+              {selectMode && (
+                <div className={`flex-shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center self-center ${isSelected ? 'bg-blue-500 border-blue-500' : 'border-slate-300 bg-white'}`}>
+                  {isSelected && (
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                  )}
+                </div>
+              )}
               {/* 头像（左侧） */}
               {!isUserSide && (
                 msg.role === "assistant" ? (
@@ -1011,7 +1164,7 @@ export default function AssistantPage() {
                   isUserSide
                     ? "bg-black text-white rounded-br-none"
                     : "bg-white text-slate-900 border border-slate-200 rounded-bl-none"
-                }`}
+                } ${isSelected ? 'ring-2 ring-blue-500' : ''}`}
               >
                 {voice ? (
                   <div 
@@ -1100,7 +1253,14 @@ export default function AssistantPage() {
                     )}
                   </div>
                 ) : (
-                  msg.content
+                  <>
+                    {/* 如果有订单卡片，只显示卡片，不显示文字 */}
+                    {msg.orders && msg.orders.length > 0 ? (
+                      <OrderCards orders={msg.orders} />
+                    ) : (
+                      msg.content
+                    )}
+                  </>
                 )}
               </div>
               
@@ -1230,23 +1390,72 @@ export default function AssistantPage() {
         )}
         {error && <div className="text-xs text-rose-500 mt-2">{error}</div>}
       </div>
+
+      {/* 多选模式下的底部操作栏 */}
+      {selectMode && (
+        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 p-4 flex items-center justify-between z-50 safe-bottom">
+          <button
+            onClick={exitSelectMode}
+            className="px-4 py-2 text-sm text-slate-600 hover:text-slate-800"
+          >
+            取消
+          </button>
+          <span className="text-sm text-slate-500">已选择 {selectedIds.size} 条消息</span>
+          <button
+            onClick={handleDeleteSelected}
+            disabled={selectedIds.size === 0}
+            className="px-4 py-2 text-sm text-red-600 hover:text-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            删除
+          </button>
+        </div>
+      )}
       
       {/* 右键菜单 */}
-      {contextMenu && (
+      {contextMenu && !selectMode && (
         <div
           className="fixed bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50 min-w-[140px]"
           style={{ top: contextMenu.y, left: contextMenu.x }}
           onClick={(e) => e.stopPropagation()}
         >
+          {/* 语音转文字（仅语音消息显示） */}
+          {contextMenu.audioUrl && (
+            <button
+              onClick={() => handleTranscribe(contextMenu.messageId, contextMenu.audioUrl!)}
+              disabled={transcribing}
+              className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+              </svg>
+              {transcribing ? "转写中..." : "语音转文字"}
+            </button>
+          )}
+          {/* 多选 */}
           <button
-            onClick={() => handleTranscribe(contextMenu.messageId, contextMenu.audioUrl)}
-            disabled={transcribing}
-            className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            onClick={() => enterSelectMode(contextMenu.messageId)}
+            className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+              <polyline points="9 11 12 14 22 4"></polyline>
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
             </svg>
-            {transcribing ? "转写中..." : "语音转文字"}
+            多选
+          </button>
+          {/* 删除 */}
+          <button
+            onClick={() => handleDeleteMessage(contextMenu.messageId)}
+            className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            删除
           </button>
         </div>
       )}

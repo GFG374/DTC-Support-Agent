@@ -2,6 +2,7 @@
 import React, { useEffect, useState, useRef, useMemo } from "react";
 import supabase from "@/lib/supabaseClient";
 import type { Session } from "@supabase/supabase-js";
+import OrderCards, { Order as OrderData } from "@/components/c/OrderCards";
 
 // ==========================================
 // 🛠️ 基础图标组件
@@ -43,7 +44,8 @@ type Msg = {
   client_message_id?: string;
   audio_url?: string | null;
   transcript?: string | null;
-  metadata?: { duration?: number } | null;
+  metadata?: { duration?: number; orders?: OrderData[] } | null;
+  orders?: OrderData[];
 };
 
 type Profile = { 
@@ -126,10 +128,70 @@ export default function InboxPage() {
   const [returnItems, setReturnItems] = useState<ReturnItem[]>([]);
   const [returnsLoading, setReturnsLoading] = useState(false);
   const [input, setInput] = useState("");
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl?: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
+  // 多选模式
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeConv = useMemo(() => conversations.find((c) => c.id === activeId), [conversations, activeId]);
+
+  useEffect(() => {
+    const handleClick = () => setContextMenu(null);
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, []);
+
+  // 删除单条消息
+  const handleDeleteMessage = async (messageId: string) => {
+    if (!session?.access_token) return;
+    try {
+      const { error } = await supabase.from("messages").delete().eq("id", messageId);
+      if (error) throw error;
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+    } catch (err) {
+      console.error("删除消息失败", err);
+    }
+    setContextMenu(null);
+  };
+
+  // 批量删除消息
+  const handleDeleteSelected = async () => {
+    if (!session?.access_token || selectedIds.size === 0) return;
+    try {
+      const ids = Array.from(selectedIds);
+      const { error } = await supabase.from("messages").delete().in("id", ids);
+      if (error) throw error;
+      setMessages(prev => prev.filter(m => !selectedIds.has(m.id)));
+      setSelectedIds(new Set());
+      setSelectMode(false);
+    } catch (err) {
+      console.error("批量删除失败", err);
+    }
+  };
+
+  // 切换选中状态
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 进入多选模式
+  const enterSelectMode = (firstId?: string) => {
+    setSelectMode(true);
+    if (firstId) setSelectedIds(new Set([firstId]));
+    setContextMenu(null);
+  };
+
+  // 退出多选模式
+  const exitSelectMode = () => {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  };
 
   useEffect(() => {
     const handleClick = () => setContextMenu(null);
@@ -230,7 +292,12 @@ export default function InboxPage() {
         
         if (!isMounted) return;
         
-        const msgs = (res.items as Msg[]) || [];
+        const rawMsgs = (res.items as Msg[]) || [];
+        // 从 metadata 提取 orders 数据
+        const msgs = rawMsgs.map(m => ({
+          ...m,
+          orders: m.orders || m.metadata?.orders
+        }));
         // 记录已加载的消息ID
         msgs.forEach(m => loadedMsgIds.add(m.id));
         setMessages(msgs);
@@ -261,7 +328,9 @@ export default function InboxPage() {
           if (!isMounted) return;
           
           if (payload.eventType === "INSERT") {
-            const newMsg = payload.new as Msg;
+            const rawMsg = payload.new as Msg;
+            // 从 metadata 提取 orders
+            const newMsg = { ...rawMsg, orders: rawMsg.orders || rawMsg.metadata?.orders };
             
             // 严格去重：检查ID是否已存在
             if (loadedMsgIds.has(newMsg.id)) return;
@@ -293,7 +362,12 @@ export default function InboxPage() {
           headers: { Authorization: `Bearer ${session!.access_token}` },
         }).then((r) => r.json());
         
-        const newMsgs = (res.items as Msg[]) || [];
+        const rawMsgs = (res.items as Msg[]) || [];
+        // 从 metadata 提取 orders
+        const newMsgs = rawMsgs.map(m => ({
+          ...m,
+          orders: m.orders || m.metadata?.orders
+        }));
         
         setMessages((prev) => {
           // 找出新消息
@@ -401,6 +475,31 @@ export default function InboxPage() {
       if (result?.id) {
         setMessages((prev) => prev.map(m => m.id === messageId ? { ...m, ...result } : m));
       }
+
+      // 3. 如果对话是 AI 模式，刷新消息列表以获取 AI 回复
+      const currentConv = conversations.find(c => c.id === activeId);
+      if (currentConv?.status === 'ai') {
+        // 等待一下让 AI 有时间响应
+        setTimeout(async () => {
+          try {
+            const refreshRes = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+              headers: { Authorization: `Bearer ${session.access_token}` },
+            });
+            if (refreshRes.ok) {
+              const refreshed = await refreshRes.json();
+              if (Array.isArray(refreshed.items)) {
+                const msgs = refreshed.items.map((m: Msg) => ({
+                  ...m,
+                  orders: m.orders || m.metadata?.orders
+                }));
+                setMessages(msgs);
+              }
+            }
+          } catch (e) {
+            console.error('刷新消息失败:', e);
+          }
+        }, 1000);
+      }
     } catch (err) {
       console.error("send reply error", err);
       setMessages((prev) => prev.filter(m => m.id !== messageId));
@@ -472,7 +571,11 @@ export default function InboxPage() {
         if (refreshedRes.ok) {
           const refreshed = await refreshedRes.json();
           if (Array.isArray(refreshed.items) && refreshed.items.length > 0) {
-            setMessages(refreshed.items as Msg[]);
+            const msgs = refreshed.items.map((m: Msg) => ({
+              ...m,
+              orders: m.orders || m.metadata?.orders
+            }));
+            setMessages(msgs);
           }
         }
         
@@ -514,7 +617,11 @@ export default function InboxPage() {
         if (refreshedRes.ok) {
           const refreshed = await refreshedRes.json();
           if (Array.isArray(refreshed.items) && refreshed.items.length > 0) {
-            setMessages(refreshed.items as Msg[]);
+            const msgs = refreshed.items.map((m: Msg) => ({
+              ...m,
+              orders: m.orders || m.metadata?.orders
+            }));
+            setMessages(msgs);
           }
         }
         
@@ -549,9 +656,28 @@ export default function InboxPage() {
   const renderBubble = (msg: Msg, isUser: boolean) => {
     const voice = parseVoice(msg);
     const userProfile = profiles[msg.user_id];
+    const isSelected = selectedIds.has(msg.id);
     
     return (
-      <div className={`flex ${isUser ? 'justify-start' : 'justify-end'} fade-in`}>
+      <div 
+        className={`flex ${isUser ? 'justify-start' : 'justify-end'} fade-in ${selectMode ? 'cursor-pointer' : ''}`}
+        onClick={() => selectMode && toggleSelect(msg.id)}
+        onContextMenu={(e) => {
+          if (selectMode) return;
+          e.preventDefault();
+          setContextMenu({ x: e.clientX, y: e.clientY, messageId: msg.id, audioUrl: voice?.url || undefined });
+        }}
+      >
+        {/* 多选模式下的复选框 */}
+        {selectMode && (
+          <div className={`flex-shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center self-center mr-2 ${isSelected ? 'bg-blue-500 border-blue-500' : 'border-slate-300 bg-white'}`}>
+            {isSelected && (
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+            )}
+          </div>
+        )}
         {isUser && (
           <div className="w-8 h-8 bg-gray-200 rounded-full flex items-center justify-center text-xs text-gray-600 mr-3 flex-shrink-0">
             {userProfile?.avatar_url ? (
@@ -565,18 +691,7 @@ export default function InboxPage() {
           msg.role === 'user' 
             ? 'bg-black text-white rounded-tl-none' 
             : 'bg-white border border-slate-200 text-slate-900 rounded-tr-none'
-        }`}
-        onContextMenu={(e) => {
-          if (voice?.url) {
-            e.preventDefault();
-            setContextMenu({
-              x: e.clientX,
-              y: e.clientY,
-              messageId: msg.id,
-              audioUrl: voice.url
-            });
-          }
-        }}
+        } ${isSelected ? 'ring-2 ring-blue-500' : ''}`}
         >
           {voice ? (
             <div className="space-y-2 min-w-[180px]">
@@ -621,7 +736,14 @@ export default function InboxPage() {
               )}
             </div>
           ) : (
-            msg.content
+            <>
+              {/* 如果有订单卡片，只显示卡片，不显示文字 */}
+              {(msg.orders && msg.orders.length > 0) || (msg.metadata?.orders && msg.metadata.orders.length > 0) ? (
+                <OrderCards orders={msg.orders || msg.metadata?.orders || []} />
+              ) : (
+                msg.content
+              )}
+            </>
           )}
           {msg.role === 'assistant' && !voice && (
             <div className="text-[10px] text-blue-500 mt-2 flex items-center gap-1">
@@ -882,21 +1004,72 @@ export default function InboxPage() {
             })}
         </div>
       </div>
-{contextMenu && (
+
+      {/* 多选模式下的底部操作栏 */}
+      {selectMode && (
+        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 p-4 flex items-center justify-between z-50">
+          <button
+            onClick={exitSelectMode}
+            className="px-4 py-2 text-sm text-slate-600 hover:text-slate-800"
+          >
+            取消
+          </button>
+          <span className="text-sm text-slate-500">已选择 {selectedIds.size} 条消息</span>
+          <button
+            onClick={handleDeleteSelected}
+            disabled={selectedIds.size === 0}
+            className="px-4 py-2 text-sm text-red-600 hover:text-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            删除
+          </button>
+        </div>
+      )}
+
+      {/* 右键菜单 */}
+      {contextMenu && !selectMode && (
         <div
           className="fixed bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50 min-w-[140px]"
           style={{ top: contextMenu.y, left: contextMenu.x }}
           onClick={(e) => e.stopPropagation()}
         >
+          {/* 语音转文字（仅语音消息显示） */}
+          {contextMenu.audioUrl && (
+            <button
+              onClick={() => handleTranscribe(contextMenu.messageId, contextMenu.audioUrl!)}
+              disabled={transcribing}
+              className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+              </svg>
+              {transcribing ? "转写中..." : "语音转文字"}
+            </button>
+          )}
+          {/* 多选 */}
           <button
-            onClick={() => handleTranscribe(contextMenu.messageId, contextMenu.audioUrl)}
-            disabled={transcribing}
-            className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            onClick={() => enterSelectMode(contextMenu.messageId)}
+            className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+              <polyline points="9 11 12 14 22 4"></polyline>
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
             </svg>
-            {transcribing ? "转写中..." : "语音转文字"}
+            多选
+          </button>
+          {/* 删除 */}
+          <button
+            onClick={() => handleDeleteMessage(contextMenu.messageId)}
+            className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            删除
           </button>
         </div>
       )}

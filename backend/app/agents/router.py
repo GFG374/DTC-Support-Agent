@@ -61,11 +61,12 @@ class RouterAgent:
         ]
         
         try:
-            response = await chat_completion(messages)
+            # router不需要工具调用,只做意图识别
+            response = await chat_completion(messages, enable_tools=False)
             
             # 解析 JSON 响应
             # Kimi 可能返回包含 ```json 代码块的格式，需要提取
-            content = response.strip()
+            content = response.content.strip()
             if "```json" in content:
                 # 提取 JSON 部分
                 start = content.find("```json") + 7
@@ -88,7 +89,7 @@ class RouterAgent:
             
         except json.JSONDecodeError as e:
             # JSON 解析失败，返回默认结果
-            print(f"[Router] JSON 解析失败: {e}, 原始响应: {response}")
+            print(f"[Router] JSON 解析失败: {e}, 原始响应: {response.content if hasattr(response, 'content') else response}")
             return {
                 "intent": "general_question",
                 "confidence": 0.3,

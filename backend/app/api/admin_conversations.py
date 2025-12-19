@@ -96,7 +96,7 @@ async def admin_add_message(
             record["id"] = message_id
         if client_message_id:
             record["client_message_id"] = client_message_id
-        res = client.table("messages").upsert(record, on_conflict="id").execute()
+        res = client.table("messages").upsert(record).execute()
         return res.data[0] if res.data else {}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"insert failed: {exc}")

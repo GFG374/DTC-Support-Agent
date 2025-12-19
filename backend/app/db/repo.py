@@ -44,7 +44,7 @@ class Repository:
 
     @staticmethod
     def _return_user_columns() -> List[str]:
-        return ["usr_id", "user_id"]
+        return ["user_id", "usr_id"]
 
     @staticmethod
     def _is_column_error(error: object) -> bool:

@@ -383,6 +383,8 @@ async def chat_with_agent(
             media_type="text/event-stream",
         )
 
+    # 前端已经保存了用户消息，这里不再重复保存
+    # 直接获取历史消息
     qa_agent = QAAgent(user_id=user.user_id, repo=repo)
 
     history = repo.list_messages(conversation_id, user.user_id)
@@ -398,6 +400,7 @@ async def chat_with_agent(
 
             assistant_reply = result["message"]
             tool_calls = result.get("tool_calls")
+            tool_data = result.get("tool_data", {})  # 结构化数据
             transfer_reason = None
 
             print(f"[Agent] AI reply: {assistant_reply[:100]}...")
@@ -449,6 +452,10 @@ async def chat_with_agent(
                 async for chunk in stream_skip("transfer_to_human"):
                     yield chunk
                 return
+
+            # 先发送结构化数据（如果有订单数据）
+            if tool_data:
+                yield f"data: {json.dumps({'tool_data': tool_data}, ensure_ascii=False)}\n\n"
 
             for char in assistant_reply:
                 yield f"data: {json.dumps({'content': char}, ensure_ascii=False)}\n\n"

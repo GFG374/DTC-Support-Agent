@@ -49,7 +49,7 @@ async def register_user(payload: RegisterPayload):
         "email": payload.email,  # 存储邮箱，方便后续查询
     }
     admin_client.table("user_profiles").upsert(
-        profile_data, on_conflict="user_id"
+        profile_data
     ).execute()
 
     role = "customer"
