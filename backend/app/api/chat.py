@@ -25,11 +25,12 @@ class ChatRequest(BaseModel):
     message: Optional[str] = None
     audio_url: Optional[str] = None
     is_voice: bool = False
+    assistant_message_id: Optional[str] = None
 
 
 def extract_order_id(text: str) -> Optional[str]:
     """从用户消息中提取订单号。"""
-    pattern = r"ORD\d{11,}"
+    pattern = r"ORD[-_A-Z0-9]{3,}"
     match = re.search(pattern, text.upper())
     if match:
         return match.group(0)
@@ -359,11 +360,6 @@ async def chat_with_agent(
                 stream_skip("human_takeover"),
                 media_type="text/event-stream",
             )
-        if conv_status == "pending_agent":
-            return StreamingResponse(
-                stream_skip("pending_agent"),
-                media_type="text/event-stream",
-            )
 
     transfer_reason = detect_transfer_reason(user_message)
     if transfer_reason:
@@ -383,6 +379,8 @@ async def chat_with_agent(
             media_type="text/event-stream",
         )
 
+    # 前端已经保存了用户消息，这里不再重复保存
+    # 直接获取历史消息
     qa_agent = QAAgent(user_id=user.user_id, repo=repo)
 
     history = repo.list_messages(conversation_id, user.user_id)
@@ -398,6 +396,7 @@ async def chat_with_agent(
 
             assistant_reply = result["message"]
             tool_calls = result.get("tool_calls")
+            tool_data = result.get("tool_data", {})  # 结构化数据
             transfer_reason = None
 
             print(f"[Agent] AI reply: {assistant_reply[:100]}...")
@@ -427,6 +426,9 @@ async def chat_with_agent(
             else:
                 print("[Agent] no tool calls")
 
+            if not transfer_reason and tool_data.get("transfer"):
+                transfer_reason = tool_data["transfer"].get("reason") or "退款需要人工处理"
+
             if transfer_reason:
                 print(f"[Agent] transfer to human, reason: {transfer_reason}")
 
@@ -445,10 +447,35 @@ async def chat_with_agent(
                 ).execute()
 
                 print("[Agent] conversation status set to pending_agent")
+                if assistant_reply:
+                    if "人工" not in assistant_reply:
+                        assistant_reply = (
+                            f"{assistant_reply}\n\n"
+                            f"很抱歉，原因：{transfer_reason}。我将为您联系人工客服，请稍候~"
+                        )
+                else:
+                    assistant_reply = f"很抱歉，原因：{transfer_reason}。我将为您联系人工客服，请稍候~"
 
-                async for chunk in stream_skip("transfer_to_human"):
-                    yield chunk
-                return
+            if assistant_reply:
+                message_payload = {
+                    "conversation_id": conversation_id,
+                    "user_id": user.user_id,
+                    "role": "assistant",
+                    "content": assistant_reply,
+                }
+                if payload.assistant_message_id:
+                    message_payload["id"] = payload.assistant_message_id
+                    message_payload["client_message_id"] = payload.assistant_message_id
+                if tool_data.get("orders"):
+                    message_payload["metadata"] = {"orders": tool_data.get("orders")}
+                try:
+                    db_client.table("messages").upsert(message_payload).execute()
+                except Exception as exc:
+                    print(f"[Agent] failed to persist assistant reply: {exc}")
+
+            # 先发送结构化数据（如果有订单数据）
+            if tool_data:
+                yield f"data: {json.dumps({'tool_data': tool_data}, ensure_ascii=False)}\n\n"
 
             for char in assistant_reply:
                 yield f"data: {json.dumps({'content': char}, ensure_ascii=False)}\n\n"

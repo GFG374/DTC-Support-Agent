@@ -44,7 +44,7 @@ class Repository:
 
     @staticmethod
     def _return_user_columns() -> List[str]:
-        return ["usr_id", "user_id"]
+        return ["user_id", "usr_id"]
 
     @staticmethod
     def _is_column_error(error: object) -> bool:
@@ -68,6 +68,10 @@ class Repository:
         if match:
             return match.group(1)
         return None
+
+    @staticmethod
+    def _response_error(res: object) -> Optional[object]:
+        return getattr(res, "error", None)
 
     # Conversations -----------------------------------------------------------------
     def create_conversation(self, user_id: str, title: str = "Conversation") -> str:
@@ -268,17 +272,18 @@ class Repository:
                     removed_columns = set()
                     while True:
                         res = self.client.table("returns").insert(payload).execute()
-                        if res.error:
-                            last_error = res.error
-                            missing = self._extract_missing_column(res.error)
-                            if self._is_column_error(res.error) and missing:
+                        error = self._response_error(res)
+                        if error:
+                            last_error = error
+                            missing = self._extract_missing_column(error)
+                            if self._is_column_error(error) and missing:
                                 if missing in (user_col, id_col):
                                     break
                                 if missing in payload and missing not in removed_columns:
                                     payload.pop(missing, None)
                                     removed_columns.add(missing)
                                     continue
-                            raise RuntimeError(str(res.error))
+                            raise RuntimeError(str(error))
                         return self._normalize_return_row(res.data[0]) or res.data[0]
             if last_error:
                 raise RuntimeError(str(last_error))
@@ -308,17 +313,18 @@ class Repository:
                             .eq(user_col, user_id)
                             .execute()
                         )
-                        if res.error:
-                            last_error = res.error
-                            missing = self._extract_missing_column(res.error)
-                            if self._is_column_error(res.error) and missing:
+                        error = self._response_error(res)
+                        if error:
+                            last_error = error
+                            missing = self._extract_missing_column(error)
+                            if self._is_column_error(error) and missing:
                                 if missing in (user_col, id_col):
                                     break
                                 if missing in payload and missing not in removed_columns:
                                     payload.pop(missing, None)
                                     removed_columns.add(missing)
                                     continue
-                            raise RuntimeError(str(res.error))
+                            raise RuntimeError(str(error))
                         if res.data:
                             return self._normalize_return_row(res.data[0]) or res.data[0]
                         break
@@ -385,6 +391,27 @@ class Repository:
         return [
             task for task in self.memory["approval_tasks"].values() if task["user_id"] == user_id
         ]
+
+    def get_latest_return(self, user_id: str, order_id: str) -> Optional[Dict[str, Any]]:
+        if not self.client:
+            return None
+        for user_col in self._return_user_columns():
+            try:
+                res = (
+                    self.client.table("returns")
+                    .select("*")
+                    .eq(user_col, user_id)
+                    .eq("order_id", order_id)
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                row = res.data[0] if res.data else None
+                if row:
+                    return self._normalize_return_row(row) or row
+            except Exception:
+                continue
+        return None
 
 
 def get_repo() -> Repository:

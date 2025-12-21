@@ -2,6 +2,7 @@
 import React, { useEffect, useState, useRef, useMemo } from "react";
 import supabase from "@/lib/supabaseClient";
 import type { Session } from "@supabase/supabase-js";
+import OrderCards, { Order as OrderData } from "@/components/c/OrderCards";
 
 // ==========================================
 // 🛠️ 基础图标组件
@@ -40,10 +41,12 @@ type Msg = {
   role: string;
   content: string;
   created_at?: string;
+  updated_at?: string;
   client_message_id?: string;
   audio_url?: string | null;
   transcript?: string | null;
-  metadata?: { duration?: number } | null;
+  metadata?: { duration?: number; orders?: OrderData[] } | null;
+  orders?: OrderData[];
 };
 
 type Profile = { 
@@ -63,8 +66,41 @@ type ReturnItem = {
   refund_status?: string | null;
   refund_amount?: number | null;
   requested_amount?: number | null;
+  order_paid_amount?: number | null;
+  order_created_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+};
+
+type OrderItem = {
+  id?: string;
+  sku?: string | null;
+  name?: string | null;
+  qty?: number | null;
+  unit_price?: number | null;
+};
+
+type OrderDetail = {
+  order_id?: string | null;
+  user_id?: string | null;
+  created_at?: string | null;
+  paid_amount?: number | null;
+  currency?: string | null;
+  status?: string | null;
+  shipping_status?: string | null;
+  tracking_no?: string | null;
+  order_items?: OrderItem[] | null;
+  items?: OrderItem[] | null;
+};
+
+type OrderReturn = {
+  status?: string | null;
+  refund_status?: string | null;
+  refund_amount?: number | null;
+  requested_amount?: number | null;
+  refund_completed_at?: string | null;
+  refund_error?: string | null;
+  created_at?: string | null;
 };
 
 const parseVoice = (msg: Msg) => {
@@ -116,6 +152,14 @@ const formatReturnStatus = (item: ReturnItem) => {
   return raw ? "售后处理中" : "暂无状态";
 };
 
+const ORDER_ID_REGEX = /ORD[-_A-Z0-9]{3,}/i;
+
+const extractOrderId = (text?: string | null) => {
+  if (!text) return null;
+  const match = text.match(ORDER_ID_REGEX);
+  return match ? match[0].toUpperCase() : null;
+};
+
 export default function InboxPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -125,11 +169,290 @@ export default function InboxPage() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [returnItems, setReturnItems] = useState<ReturnItem[]>([]);
   const [returnsLoading, setReturnsLoading] = useState(false);
+  const [autoRefundThreshold, setAutoRefundThreshold] = useState(700);
+  const [activeOrderId, setActiveOrderId] = useState<string | null>(null);
+  const [activeOrder, setActiveOrder] = useState<OrderDetail | null>(null);
+  const [activeReturn, setActiveReturn] = useState<OrderReturn | null>(null);
+  const [orderLoading, setOrderLoading] = useState(false);
+  const [orderError, setOrderError] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl?: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
+  const [refreshTick, setRefreshTick] = useState(0);
+  // 多选模式
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeConv = useMemo(() => conversations.find((c) => c.id === activeId), [conversations, activeId]);
+  const mentionedOrderId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i];
+      if (msg.role !== "user" && msg.role !== "ai_voice") continue;
+      const found = extractOrderId(msg.content);
+      if (found) return found;
+    }
+    return null;
+  }, [messages]);
+
+  useEffect(() => {
+    setActiveOrderId(mentionedOrderId);
+  }, [mentionedOrderId]);
+
+  useEffect(() => {
+    setActiveOrder(null);
+    setActiveReturn(null);
+    setOrderError(null);
+  }, [activeId]);
+
+  const shouldShowReturn = (item: ReturnItem) => {
+    const refundStatus = (item.refund_status || "").toLowerCase();
+    const status = (item.status || "").toLowerCase();
+    if (refundStatus === "success" || status === "refunded") return false;
+    return true;
+  };
+
+  const mergeReturns = (current: ReturnItem[], incoming: ReturnItem[]) => {
+    const map = new Map<string, ReturnItem>();
+    const all = [...current, ...incoming];
+    for (const item of all) {
+      const key = item.order_id || item.id || item.rma_id;
+      if (!key) continue;
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, item);
+        continue;
+      }
+      const existingTime = existing.updated_at
+        ? new Date(existing.updated_at).getTime()
+        : existing.created_at
+        ? new Date(existing.created_at).getTime()
+        : 0;
+      const nextTime = item.updated_at
+        ? new Date(item.updated_at).getTime()
+        : item.created_at
+        ? new Date(item.created_at).getTime()
+        : 0;
+      if (nextTime >= existingTime) {
+        const mergedItem = {
+          ...existing,
+          ...item,
+          order_created_at: item.order_created_at || existing.order_created_at,
+          order_paid_amount: item.order_paid_amount ?? existing.order_paid_amount,
+        };
+        map.set(key, mergedItem);
+      }
+    }
+    return Array.from(map.values());
+  };
+
+  const mergeMessages = (current: Msg[], incoming: Msg[]) => {
+    if (incoming.length === 0) return current;
+    const map = new Map<string, Msg>();
+    for (const msg of current) {
+      map.set(msg.id, msg);
+    }
+    for (const msg of incoming) {
+      map.set(msg.id, { ...map.get(msg.id), ...msg });
+    }
+    const merged = Array.from(map.values());
+    merged.sort((a, b) => {
+      const at = new Date(a.created_at || 0).getTime();
+      const bt = new Date(b.created_at || 0).getTime();
+      return at - bt;
+    });
+    return merged;
+  };
+
+  const getAccessToken = async () => {
+    const { data } = await supabase.auth.getSession();
+    return data.session?.access_token || session?.access_token || null;
+  };
+
+  const handleDeleteReturn = async (returnId?: string) => {
+    if (!returnId) return;
+    const accessToken = await getAccessToken();
+    if (!accessToken) return;
+    const confirmed = window.confirm("确认删除这条售后记录？");
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`/api/admin/returns/${returnId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!res.ok) {
+        window.alert("删除失败，请检查权限或稍后重试。");
+        return;
+      }
+      setReturnItems((prev) => prev.filter((item) => (item.id || item.rma_id) !== returnId));
+      window.alert("删除成功。");
+    } catch (err) {
+      console.error("delete return failed", err);
+      window.alert("删除失败，请检查权限或稍后重试。");
+    }
+  };
+
+  const handleRefundReturn = async (orderId?: string) => {
+    if (!orderId) return;
+    const accessToken = await getAccessToken();
+    if (!accessToken) return;
+    const confirmed = window.confirm("确认对该订单执行退款？");
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`/api/admin/orders/${orderId}/refund`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!res.ok) {
+        window.alert("退款失败，请检查权限或稍后重试。");
+        return;
+      }
+      const result = await res.json();
+      if (result?.refund?.success) {
+        setReturnItems((prev) =>
+          prev.map((item) =>
+            item.order_id === orderId
+              ? { ...item, refund_status: "success", status: "refunded", refund_amount: result.amount_cents }
+              : item
+          )
+        );
+        window.alert("退款成功。");
+      } else {
+        window.alert("退款未成功，请查看日志或稍后重试。");
+      }
+    } catch (err) {
+      console.error("refund return failed", err);
+      window.alert("退款失败，请检查权限或稍后重试。");
+    }
+  };
+
+  const handleClearMessages = () => {
+    setMessages([]);
+    setRefreshTick((prev) => prev + 1);
+  };
+
+  const getReturnAmount = (item: ReturnItem) => {
+    const candidates = [
+      item.requested_amount,
+      item.refund_amount,
+      item.order_paid_amount,
+    ];
+    for (const value of candidates) {
+      if (typeof value === "number" && value > 0) {
+        return value;
+      }
+      if (typeof value === "string") {
+        const parsed = Number(value);
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          return parsed;
+        }
+      }
+    }
+    return null;
+  };
+
+  const getOrderAmount = (order?: OrderDetail | null, ret?: OrderReturn | null) => {
+    const candidates = [
+      ret?.refund_amount,
+      ret?.requested_amount,
+      order?.paid_amount,
+    ];
+    for (const value of candidates) {
+      if (typeof value === "number" && value > 0) return value;
+    }
+    return null;
+  };
+
+  const getRefundStatusText = (ret?: OrderReturn | null) => {
+    if (!ret) return null;
+    const raw = (ret.refund_status || ret.status || "").toLowerCase();
+    if (raw.includes("success") || raw.includes("refunded")) return "退款成功";
+    if (raw.includes("failed")) return "退款失败";
+    if (raw.includes("processing")) return "退款处理中";
+    if (raw.includes("awaiting") || raw.includes("pending")) return "等待审核";
+    if (raw.includes("rejected")) return "已拒绝";
+    return null;
+  };
+
+  const getRefundEligibilityText = () => {
+    if (!activeOrder) return null;
+    const orderAmount = getOrderAmount(activeOrder, activeReturn);
+    const createdAt = activeOrder.created_at ? new Date(activeOrder.created_at) : null;
+    if (!orderAmount || !createdAt || Number.isNaN(createdAt.getTime())) {
+      return "无法判断退款条件";
+    }
+    const days = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (days > 30) return "不满足退款条件，无法退款";
+    if (orderAmount / 100 <= autoRefundThreshold) return "自动退款额度内，无需人工介入";
+    return "需要人工介入";
+  };
+
+  const isAdminRefundAllowed = (item: ReturnItem) => {
+    const amount = getReturnAmount(item);
+    if (!amount || amount <= 0) return false;
+    if (amount / 100 <= autoRefundThreshold) return false;
+    if (!item.order_created_at) return false;
+    const createdAt = new Date(item.order_created_at);
+    if (Number.isNaN(createdAt.getTime())) return false;
+    const days = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    return days <= 30;
+  };
+
+  useEffect(() => {
+    const handleClick = () => setContextMenu(null);
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, []);
+
+  // 删除单条消息
+  const handleDeleteMessage = async (messageId: string) => {
+    if (!session?.access_token) return;
+    try {
+      const { error } = await supabase.from("messages").delete().eq("id", messageId);
+      if (error) throw error;
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+    } catch (err) {
+      console.error("删除消息失败", err);
+    }
+    setContextMenu(null);
+  };
+
+  // 批量删除消息
+  const handleDeleteSelected = async () => {
+    if (!session?.access_token || selectedIds.size === 0) return;
+    try {
+      const ids = Array.from(selectedIds);
+      const { error } = await supabase.from("messages").delete().in("id", ids);
+      if (error) throw error;
+      setMessages(prev => prev.filter(m => !selectedIds.has(m.id)));
+      setSelectedIds(new Set());
+      setSelectMode(false);
+    } catch (err) {
+      console.error("批量删除失败", err);
+    }
+  };
+
+  // 切换选中状态
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 进入多选模式
+  const enterSelectMode = (firstId?: string) => {
+    setSelectMode(true);
+    if (firstId) setSelectedIds(new Set([firstId]));
+    setContextMenu(null);
+  };
+
+  // 退出多选模式
+  const exitSelectMode = () => {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  };
 
   useEffect(() => {
     const handleClick = () => setContextMenu(null);
@@ -138,7 +461,17 @@ export default function InboxPage() {
   }, []);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session || null));
+    let mounted = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (mounted) setSession(data.session || null);
+    });
+    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (mounted) setSession(nextSession);
+    });
+    return () => {
+      mounted = false;
+      data.subscription.unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -230,10 +563,15 @@ export default function InboxPage() {
         
         if (!isMounted) return;
         
-        const msgs = (res.items as Msg[]) || [];
+        const rawMsgs = (res.items as Msg[]) || [];
+        // 从 metadata 提取 orders 数据
+        const msgs = rawMsgs.map(m => ({
+          ...m,
+          orders: m.orders || m.metadata?.orders
+        }));
         // 记录已加载的消息ID
         msgs.forEach(m => loadedMsgIds.add(m.id));
-        setMessages(msgs);
+        setMessages((prev) => mergeMessages(prev, msgs));
         
         const latest = msgs.slice(-1)[0];
         if (latest) {
@@ -251,28 +589,40 @@ export default function InboxPage() {
       .channel(`admin-msgs-${activeId}`)
       .on(
         "postgres_changes",
-        { 
-          event: "*", 
-          schema: "public", 
+        {
+          event: "*",
+          schema: "public",
           table: "messages",
-          filter: `conversation_id=eq.${activeId}`
+          filter: `conversation_id=eq.${activeId}`,
         },
         (payload) => {
           if (!isMounted) return;
-          
+          const rawMsg = payload.new as Msg | undefined;
+          if (!rawMsg) return;
+          const newMsg = { ...rawMsg, orders: rawMsg.orders || rawMsg.metadata?.orders };
+
+          if (payload.eventType === "UPDATE") {
+            loadedMsgIds.add(newMsg.id);
+            setMessages((prev) => {
+              const existing = prev.find((m) => m.id === newMsg.id);
+              if (!existing) return [...prev, newMsg];
+              return prev.map((m) => (m.id === newMsg.id ? { ...m, ...newMsg } : m));
+            });
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === newMsg.conversation_id ? { ...c, last_content: newMsg.content } : c
+              )
+            );
+            return;
+          }
+
           if (payload.eventType === "INSERT") {
-            const newMsg = payload.new as Msg;
-            
-            // 严格去重：检查ID是否已存在
             if (loadedMsgIds.has(newMsg.id)) return;
             loadedMsgIds.add(newMsg.id);
-            
             setMessages((prev) => {
-              // 双重检查
-              if (prev.some(m => m.id === newMsg.id)) return prev;
+              if (prev.some((m) => m.id === newMsg.id)) return prev;
               return [...prev, newMsg];
             });
-            
             setConversations((prev) =>
               prev.map((c) =>
                 c.id === newMsg.conversation_id ? { ...c, last_content: newMsg.content } : c
@@ -293,17 +643,18 @@ export default function InboxPage() {
           headers: { Authorization: `Bearer ${session!.access_token}` },
         }).then((r) => r.json());
         
-        const newMsgs = (res.items as Msg[]) || [];
+        const rawMsgs = (res.items as Msg[]) || [];
+        // 从 metadata 提取 orders
+        const newMsgs = rawMsgs.map(m => ({
+          ...m,
+          orders: m.orders || m.metadata?.orders
+        }));
         
         setMessages((prev) => {
-          // 找出新消息
-          const existingIds = new Set(prev.map(m => m.id));
-          const toAdd = newMsgs.filter(m => !existingIds.has(m.id) && !loadedMsgIds.has(m.id));
-          
-          if (toAdd.length === 0) return prev;
-          
-          toAdd.forEach(m => loadedMsgIds.add(m.id));
-          return [...prev, ...toAdd];
+          if (newMsgs.length === 0) return prev;
+          const merged = mergeMessages(prev, newMsgs);
+          merged.forEach((m) => loadedMsgIds.add(m.id));
+          return merged;
         });
       } catch (err) {
         // 忽略轮询错误
@@ -315,7 +666,7 @@ export default function InboxPage() {
       clearInterval(pollInterval);
       supabase.removeChannel(channel);
     };
-  }, [session?.user, activeId, session?.access_token]);
+  }, [session?.user, activeId, session?.access_token, refreshTick]);
 
   useEffect(() => {
     if (!session?.access_token || !activeConv?.user_id) {
@@ -330,7 +681,13 @@ export default function InboxPage() {
           headers: { Authorization: `Bearer ${session.access_token}` },
         }).then((r) => r.json());
         if (!cancelled) {
-          setReturnItems(Array.isArray(res.items) ? res.items : []);
+          const items = Array.isArray(res.items) ? res.items : [];
+          const merged = mergeReturns([], items).filter(shouldShowReturn);
+          setReturnItems(merged);
+          const threshold = Number(res?.meta?.auto_refund_threshold);
+          if (!Number.isNaN(threshold) && threshold > 0) {
+            setAutoRefundThreshold(threshold);
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -350,10 +707,71 @@ export default function InboxPage() {
   }, [session?.access_token, activeConv?.user_id]);
 
   useEffect(() => {
+    if (!activeConv?.user_id) return;
+    const channel = supabase
+      .channel(`admin-returns-${activeConv.user_id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "returns" },
+        (payload) => {
+          const row = payload.new as ReturnItem | undefined;
+          if (!row) return;
+          const rowUserId = (row as any).user_id || (row as any).usr_id;
+          if (rowUserId && rowUserId !== activeConv.user_id) return;
+          setReturnItems((prev) => mergeReturns(prev, [row]).filter(shouldShowReturn));
+        }
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [activeConv?.user_id]);
+
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  useEffect(() => {
+    if (!session?.access_token || !activeOrderId) {
+      setActiveOrder(null);
+      setActiveReturn(null);
+      setOrderError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadOrder = async () => {
+      setOrderLoading(true);
+      setOrderError(null);
+      try {
+        const res = await fetch(`/api/admin/orders/${activeOrderId}`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+        if (!res.ok) {
+          const detail = await res.text();
+          throw new Error(detail || "order_fetch_failed");
+        }
+        const data = await res.json();
+        if (!cancelled) {
+          setActiveOrder((data?.order as OrderDetail) || null);
+          setActiveReturn((data?.return as OrderReturn) || null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setActiveOrder(null);
+          setActiveReturn(null);
+          setOrderError("订单不存在或无法获取");
+        }
+      } finally {
+        if (!cancelled) setOrderLoading(false);
+      }
+    };
+    loadOrder();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.access_token, activeOrderId]);
 
   const sendReply = async () => {
     if (!input.trim() || !activeId || !session?.access_token) return;
@@ -400,6 +818,31 @@ export default function InboxPage() {
       
       if (result?.id) {
         setMessages((prev) => prev.map(m => m.id === messageId ? { ...m, ...result } : m));
+      }
+
+      // 3. 如果对话是 AI 模式，刷新消息列表以获取 AI 回复
+      const currentConv = conversations.find(c => c.id === activeId);
+      if (currentConv?.status === 'ai') {
+        // 等待一下让 AI 有时间响应
+        setTimeout(async () => {
+          try {
+            const refreshRes = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+              headers: { Authorization: `Bearer ${session.access_token}` },
+            });
+            if (refreshRes.ok) {
+              const refreshed = await refreshRes.json();
+              if (Array.isArray(refreshed.items)) {
+                const msgs = refreshed.items.map((m: Msg) => ({
+                  ...m,
+                  orders: m.orders || m.metadata?.orders
+                }));
+                setMessages((prev) => mergeMessages(prev, msgs));
+              }
+            }
+          } catch (e) {
+            console.error('刷新消息失败:', e);
+          }
+        }, 1000);
       }
     } catch (err) {
       console.error("send reply error", err);
@@ -472,7 +915,11 @@ export default function InboxPage() {
         if (refreshedRes.ok) {
           const refreshed = await refreshedRes.json();
           if (Array.isArray(refreshed.items) && refreshed.items.length > 0) {
-            setMessages(refreshed.items as Msg[]);
+            const msgs = refreshed.items.map((m: Msg) => ({
+              ...m,
+              orders: m.orders || m.metadata?.orders
+            }));
+            setMessages((prev) => mergeMessages(prev, msgs));
           }
         }
         
@@ -514,7 +961,11 @@ export default function InboxPage() {
         if (refreshedRes.ok) {
           const refreshed = await refreshedRes.json();
           if (Array.isArray(refreshed.items) && refreshed.items.length > 0) {
-            setMessages(refreshed.items as Msg[]);
+            const msgs = refreshed.items.map((m: Msg) => ({
+              ...m,
+              orders: m.orders || m.metadata?.orders
+            }));
+            setMessages((prev) => mergeMessages(prev, msgs));
           }
         }
         
@@ -549,9 +1000,28 @@ export default function InboxPage() {
   const renderBubble = (msg: Msg, isUser: boolean) => {
     const voice = parseVoice(msg);
     const userProfile = profiles[msg.user_id];
+    const isSelected = selectedIds.has(msg.id);
     
     return (
-      <div className={`flex ${isUser ? 'justify-start' : 'justify-end'} fade-in`}>
+      <div 
+        className={`flex ${isUser ? 'justify-start' : 'justify-end'} fade-in ${selectMode ? 'cursor-pointer' : ''}`}
+        onClick={() => selectMode && toggleSelect(msg.id)}
+        onContextMenu={(e) => {
+          if (selectMode) return;
+          e.preventDefault();
+          setContextMenu({ x: e.clientX, y: e.clientY, messageId: msg.id, audioUrl: voice?.url || undefined });
+        }}
+      >
+        {/* 多选模式下的复选框 */}
+        {selectMode && (
+          <div className={`flex-shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center self-center mr-2 ${isSelected ? 'bg-blue-500 border-blue-500' : 'border-slate-300 bg-white'}`}>
+            {isSelected && (
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+            )}
+          </div>
+        )}
         {isUser && (
           <div className="w-8 h-8 bg-gray-200 rounded-full flex items-center justify-center text-xs text-gray-600 mr-3 flex-shrink-0">
             {userProfile?.avatar_url ? (
@@ -565,18 +1035,7 @@ export default function InboxPage() {
           msg.role === 'user' 
             ? 'bg-black text-white rounded-tl-none' 
             : 'bg-white border border-slate-200 text-slate-900 rounded-tr-none'
-        }`}
-        onContextMenu={(e) => {
-          if (voice?.url) {
-            e.preventDefault();
-            setContextMenu({
-              x: e.clientX,
-              y: e.clientY,
-              messageId: msg.id,
-              audioUrl: voice.url
-            });
-          }
-        }}
+        } ${isSelected ? 'ring-2 ring-blue-500' : ''}`}
         >
           {voice ? (
             <div className="space-y-2 min-w-[180px]">
@@ -621,7 +1080,14 @@ export default function InboxPage() {
               )}
             </div>
           ) : (
-            msg.content
+            <>
+              {/* 如果有订单卡片，只显示卡片，不显示文字 */}
+              {(msg.orders && msg.orders.length > 0) || (msg.metadata?.orders && msg.metadata.orders.length > 0) ? (
+                <OrderCards orders={msg.orders || msg.metadata?.orders || []} />
+              ) : (
+                msg.content
+              )}
+            </>
           )}
           {msg.role === 'assistant' && !voice && (
             <div className="text-[10px] text-blue-500 mt-2 flex items-center gap-1">
@@ -740,6 +1206,12 @@ export default function InboxPage() {
             
             return (
               <div className="flex gap-3">
+                <button
+                  onClick={handleClearMessages}
+                  className="px-3 py-1.5 text-xs font-medium border bg-white rounded-md text-gray-500 hover:bg-gray-50"
+                >
+                  清空缓存
+                </button>
                 <button className="px-3 py-1.5 text-xs font-medium border bg-white rounded-md text-gray-600 hover:bg-gray-50">转接同事</button>
                 
                 {/* AI 接管中 或 需人工 - 显示"接管对话"按钮 */}
@@ -854,6 +1326,51 @@ export default function InboxPage() {
           </div>
         )}
 
+        <h4 className="text-xs font-bold text-gray-400 uppercase mb-4">订单信息</h4>
+        <div className="space-y-3 mb-6">
+          {!activeOrderId && (
+            <div className="text-xs text-gray-400">未检测到订单号</div>
+          )}
+          {activeOrderId && orderLoading && (
+            <div className="text-xs text-gray-400">订单加载中...</div>
+          )}
+          {activeOrderId && orderError && (
+            <div className="text-xs text-red-500">{orderError}</div>
+          )}
+          {activeOrderId && !orderLoading && !orderError && activeOrder && (
+            <div className="border border-gray-200 rounded-xl p-3 bg-white">
+              <div className="flex items-center justify-between text-xs text-gray-500">
+                <span>订单 {activeOrder.order_id || "--"}</span>
+                <span>{formatDate(activeOrder.created_at)}</span>
+              </div>
+              <div className="text-xs text-gray-500 mt-2">
+                金额 {getOrderAmount(activeOrder, activeReturn) ? formatMoney(getOrderAmount(activeOrder, activeReturn) || undefined) : "--"}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">
+                订单状态 {(activeOrder.shipping_status || activeOrder.status) || "--"}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">
+                快递单号 {activeOrder.tracking_no || "--"}
+              </div>
+              {(activeOrder.order_items?.length || activeOrder.items?.length) ? (
+                <div className="text-xs text-gray-500 mt-2">
+                  商品 {(activeOrder.order_items || activeOrder.items || [])
+                    .slice(0, 2)
+                    .map((item) => item?.name || item?.sku || "SKU")
+                    .join("、")}
+                  {(activeOrder.order_items || activeOrder.items || []).length > 2 ? "..." : ""}
+                </div>
+              ) : null}
+              <div className="text-xs mt-2">
+                <span className="text-gray-500">退款状态</span>
+                <span className="ml-1 font-medium text-gray-900">
+                  {getRefundStatusText(activeReturn) || getRefundEligibilityText() || "--"}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+
         <h4 className="text-xs font-bold text-gray-400 uppercase mb-4">售后进度</h4>
         <div className="space-y-3">
           {returnsLoading && (
@@ -867,12 +1384,30 @@ export default function InboxPage() {
               const returnId = item.rma_id || item.id || item.order_id || "return";
               return (
                 <div key={returnId} className="border border-gray-200 rounded-xl p-3 bg-white">
-                  <div className="text-xs text-gray-500">订单 {item.order_id || "--"}</div>
+                  <div className="flex items-center justify-between text-xs text-gray-500">
+                    <span>订单 {item.order_id || "--"}</span>
+                    <div className="flex items-center gap-2">
+                      {isAdminRefundAllowed(item) && (
+                        <button
+                          onClick={() => handleRefundReturn(item.order_id || undefined)}
+                          className="text-blue-600 hover:text-blue-700"
+                        >
+                          退款
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleDeleteReturn(item.id || item.rma_id || undefined)}
+                        className="text-red-500 hover:text-red-600"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
                   <div className="font-semibold text-sm text-gray-900 mt-1">
                     {formatReturnStatus(item)}
                   </div>
                   <div className="text-xs text-gray-500 mt-1">
-                    申请金额 {formatMoney(item.requested_amount ?? item.refund_amount)}
+                    申请金额 {getReturnAmount(item) ? formatMoney(getReturnAmount(item)) : "--"}
                   </div>
                   <div className="text-[11px] text-gray-400 mt-1">
                     {formatDate(item.created_at)}
@@ -882,21 +1417,72 @@ export default function InboxPage() {
             })}
         </div>
       </div>
-{contextMenu && (
+
+      {/* 多选模式下的底部操作栏 */}
+      {selectMode && (
+        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 p-4 flex items-center justify-between z-50">
+          <button
+            onClick={exitSelectMode}
+            className="px-4 py-2 text-sm text-slate-600 hover:text-slate-800"
+          >
+            取消
+          </button>
+          <span className="text-sm text-slate-500">已选择 {selectedIds.size} 条消息</span>
+          <button
+            onClick={handleDeleteSelected}
+            disabled={selectedIds.size === 0}
+            className="px-4 py-2 text-sm text-red-600 hover:text-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            删除
+          </button>
+        </div>
+      )}
+
+      {/* 右键菜单 */}
+      {contextMenu && !selectMode && (
         <div
           className="fixed bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50 min-w-[140px]"
           style={{ top: contextMenu.y, left: contextMenu.x }}
           onClick={(e) => e.stopPropagation()}
         >
+          {/* 语音转文字（仅语音消息显示） */}
+          {contextMenu.audioUrl && (
+            <button
+              onClick={() => handleTranscribe(contextMenu.messageId, contextMenu.audioUrl!)}
+              disabled={transcribing}
+              className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+              </svg>
+              {transcribing ? "转写中..." : "语音转文字"}
+            </button>
+          )}
+          {/* 多选 */}
           <button
-            onClick={() => handleTranscribe(contextMenu.messageId, contextMenu.audioUrl)}
-            disabled={transcribing}
-            className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            onClick={() => enterSelectMode(contextMenu.messageId)}
+            className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+              <polyline points="9 11 12 14 22 4"></polyline>
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
             </svg>
-            {transcribing ? "转写中..." : "语音转文字"}
+            多选
+          </button>
+          {/* 删除 */}
+          <button
+            onClick={() => handleDeleteMessage(contextMenu.messageId)}
+            className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            删除
           </button>
         </div>
       )}

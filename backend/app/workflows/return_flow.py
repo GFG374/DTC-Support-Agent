@@ -8,6 +8,7 @@ from ..db.repo import Repository
 from ..rag import bailian
 from ..integrations.alipay import get_alipay_client
 from ..rules import returns as return_rules
+from ..agents.return_planner import ReturnPlannerAgent
 
 
 @dataclass
@@ -64,11 +65,17 @@ class ReturnFlow:
             conversation_id=conversation_id,
             user_id=user_id,
         )
+        threshold = ReturnPlannerAgent._extract_auto_refund_threshold(ctx.policy_hits)
+        if threshold is None:
+            threshold_cents = return_rules.approval_threshold()
+        else:
+            threshold_cents = int(threshold * 100)
+
         rules = return_rules.evaluate(
             days_since_purchase=return_rules.days_since(order.get("created_at")),
             condition_ok=bool(ctx.condition_ok),
             requested_amount=ctx.requested_amount or 0,
-            auto_threshold=return_rules.approval_threshold(),
+            auto_threshold=threshold_cents,
         )
 
         if not rules["within_window"] or not rules["condition_ok"]:
