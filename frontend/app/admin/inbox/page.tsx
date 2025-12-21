@@ -89,6 +89,9 @@ type OrderDetail = {
   status?: string | null;
   shipping_status?: string | null;
   tracking_no?: string | null;
+  payment_status?: string | null;
+  alipay_trade_no?: string | null;
+  paid_at?: string | null;
   order_items?: OrderItem[] | null;
   items?: OrderItem[] | null;
 };
@@ -175,6 +178,13 @@ export default function InboxPage() {
   const [activeReturn, setActiveReturn] = useState<OrderReturn | null>(null);
   const [orderLoading, setOrderLoading] = useState(false);
   const [orderError, setOrderError] = useState<string | null>(null);
+  const [showTestData, setShowTestData] = useState(false);
+  const [testDataLoading, setTestDataLoading] = useState(false);
+  const [testDataError, setTestDataError] = useState<string | null>(null);
+  const [testRefundable, setTestRefundable] = useState<OrderDetail[]>([]);
+  const [testNotRefundable, setTestNotRefundable] = useState<OrderDetail[]>([]);
+  const [testUnrefundable, setTestUnrefundable] = useState<{ order: OrderDetail; reason: string }[]>([]);
+  const [testReturnsMap, setTestReturnsMap] = useState<Record<string, OrderReturn>>({});
   const [input, setInput] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl?: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
@@ -183,6 +193,8 @@ export default function InboxPage() {
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
+  const msgLoadRetryRef = useRef<Record<string, number>>({});
+  const shouldAutoScrollRef = useRef(true);
   const activeConv = useMemo(() => conversations.find((c) => c.id === activeId), [conversations, activeId]);
   const mentionedOrderId = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -263,9 +275,16 @@ export default function InboxPage() {
     return merged;
   };
 
-  const getAccessToken = async () => {
+  const getAccessToken = async (forceRefresh = false) => {
     const { data } = await supabase.auth.getSession();
-    return data.session?.access_token || session?.access_token || null;
+    const currentSession = data.session || null;
+    const expiresAt = currentSession?.expires_at ? currentSession.expires_at * 1000 : 0;
+    const shouldRefresh = forceRefresh || !currentSession || (expiresAt > 0 && expiresAt - Date.now() < 60_000);
+    if (shouldRefresh) {
+      const { data: refreshed } = await supabase.auth.refreshSession();
+      if (refreshed.session?.access_token) return refreshed.session.access_token;
+    }
+    return currentSession?.access_token || session?.access_token || null;
   };
 
   const handleDeleteReturn = async (returnId?: string) => {
@@ -397,6 +416,103 @@ export default function InboxPage() {
     return days <= 30;
   };
 
+  const isRefundClosed = (ret?: OrderReturn | null) => {
+    if (!ret) return false;
+    const raw = (ret.refund_status || ret.status || "").toLowerCase();
+    return raw.includes("success") || raw.includes("refunded");
+  };
+
+  const isPaidOrder = (order: OrderDetail) => {
+    const status = (order.payment_status || "").toLowerCase();
+    return status === "paid" && Boolean(order.alipay_trade_no);
+  };
+
+  const isAiRefundableOrder = (order: OrderDetail) => {
+    if (!isPaidOrder(order)) return false;
+    const amount = order.paid_amount;
+    const createdAt = order.created_at ? new Date(order.created_at) : null;
+    if (!amount || !createdAt || Number.isNaN(createdAt.getTime())) return false;
+    const days = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (days > 30) return false;
+    return amount / 100 <= autoRefundThreshold;
+  };
+
+  const isAdminRefundableOrder = (order: OrderDetail) => {
+    if (!isPaidOrder(order)) return false;
+    const amount = order.paid_amount;
+    const createdAt = order.created_at ? new Date(order.created_at) : null;
+    if (!amount || !createdAt || Number.isNaN(createdAt.getTime())) return false;
+    const days = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (days > 30) return false;
+    return amount / 100 > autoRefundThreshold;
+  };
+
+  const getNotRefundableReason = (order: OrderDetail, ret?: OrderReturn | null) => {
+    if (isRefundClosed(ret)) return "已退款完成";
+    const amount = order.paid_amount;
+    if (!amount || amount <= 0) return "缺少订单金额";
+    const createdAt = order.created_at ? new Date(order.created_at) : null;
+    if (!createdAt || Number.isNaN(createdAt.getTime())) return "缺少订单时间";
+    const days = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (days > 30) return "超过30天";
+    if (!isPaidOrder(order)) return "未支付/无交易号";
+    return "不满足退款条件";
+  };
+
+  const handleToggleTestData = async () => {
+    const next = !showTestData;
+    setShowTestData(next);
+    if (!next) return;
+    setTestDataError(null);
+    setTestDataLoading(true);
+    try {
+      const accessToken = await getAccessToken();
+      if (!accessToken) throw new Error("missing_access_token");
+      const res = await fetch("/api/admin/orders?limit=200&include_returns=1", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(detail || "fetch_failed");
+      }
+      const data = await res.json();
+      const orders = Array.isArray(data?.items) ? (data.items as OrderDetail[]) : [];
+      const returnsMap = (data?.returns as Record<string, OrderReturn>) || {};
+      const refundable: OrderDetail[] = [];
+      const nonRefundable: OrderDetail[] = [];
+      const unrefundable: { order: OrderDetail; reason: string }[] = [];
+      orders.forEach((order) => {
+        const ret = returnsMap[order.order_id || ""];
+        if (isRefundClosed(ret)) return;
+        if (isAiRefundableOrder(order)) {
+          refundable.push(order);
+          return;
+        }
+        if (isAdminRefundableOrder(order)) {
+          nonRefundable.push(order);
+          return;
+        }
+        unrefundable.push({ order, reason: getNotRefundableReason(order, ret) });
+      });
+      setTestRefundable(refundable);
+      setTestNotRefundable(nonRefundable);
+      setTestUnrefundable(unrefundable);
+      setTestReturnsMap(returnsMap);
+      const threshold = Number(data?.meta?.auto_refund_threshold);
+      if (!Number.isNaN(threshold) && threshold > 0) {
+        setAutoRefundThreshold(threshold);
+      }
+    } catch (err) {
+      console.error("load test data error", err);
+      setTestRefundable([]);
+      setTestNotRefundable([]);
+      setTestUnrefundable([]);
+      setTestDataError("测试数据加载失败");
+    } finally {
+      setTestDataLoading(false);
+    }
+  };
+
   useEffect(() => {
     const handleClick = () => setContextMenu(null);
     document.addEventListener('click', handleClick);
@@ -496,9 +612,22 @@ export default function InboxPage() {
     if (!session?.user) return;
     const loadConvos = async () => {
       try {
-        const res = await fetch("/api/admin/conversations", {
-          headers: { Authorization: `Bearer ${session!.access_token}` },
-        }).then((r) => r.json());
+        const accessToken = await getAccessToken();
+        if (!accessToken) return;
+        let response = await fetch("/api/admin/conversations", {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (response.status === 401 || response.status === 403) {
+          const retryToken = await getAccessToken(true);
+          if (!retryToken) return;
+          response = await fetch("/api/admin/conversations", {
+            headers: { Authorization: `Bearer ${retryToken}` },
+          });
+        }
+        if (!response.ok) {
+          throw new Error(`load_convos_failed:${response.status}`);
+        }
+        const res = await response.json();
         const convs = (res.items || []) as Conversation[];
         setConversations(convs);
         const pMap: Record<string, Profile> = {};
@@ -553,17 +682,40 @@ export default function InboxPage() {
     
     let isMounted = true;
     const loadedMsgIds = new Set<string>();
+    msgLoadRetryRef.current[activeId] = 0;
 
     // 加载历史消息
     const loadMsgs = async () => {
       try {
-        const res = await fetch(`/api/admin/conversations/${activeId}/messages`, {
-          headers: { Authorization: `Bearer ${session!.access_token}` },
-        }).then((r) => r.json());
+        const accessToken = await getAccessToken();
+        if (!accessToken) return;
+        let response = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (response.status === 401 || response.status === 403) {
+          const retryToken = await getAccessToken(true);
+          if (!retryToken) return;
+          response = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+            cache: "no-store",
+            headers: { Authorization: `Bearer ${retryToken}` },
+          });
+        }
+        if (!response.ok) {
+          throw new Error(`load_msgs_failed:${response.status}`);
+        }
+        const res = await response.json();
         
         if (!isMounted) return;
         
         const rawMsgs = (res.items as Msg[]) || [];
+        if (rawMsgs.length === 0 && msgLoadRetryRef.current[activeId] < 1) {
+          msgLoadRetryRef.current[activeId] += 1;
+          setTimeout(() => {
+            if (isMounted) loadMsgs();
+          }, 800);
+          return;
+        }
         // 从 metadata 提取 orders 数据
         const msgs = rawMsgs.map(m => ({
           ...m,
@@ -639,9 +791,24 @@ export default function InboxPage() {
     const pollInterval = setInterval(async () => {
       if (!isMounted) return;
       try {
-        const res = await fetch(`/api/admin/conversations/${activeId}/messages`, {
-          headers: { Authorization: `Bearer ${session!.access_token}` },
-        }).then((r) => r.json());
+        const accessToken = await getAccessToken();
+        if (!accessToken) return;
+        let response = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (response.status === 401 || response.status === 403) {
+          const retryToken = await getAccessToken(true);
+          if (!retryToken) return;
+          response = await fetch(`/api/admin/conversations/${activeId}/messages`, {
+            cache: "no-store",
+            headers: { Authorization: `Bearer ${retryToken}` },
+          });
+        }
+        if (!response.ok) {
+          throw new Error(`poll_msgs_failed:${response.status}`);
+        }
+        const res = await response.json();
         
         const rawMsgs = (res.items as Msg[]) || [];
         // 从 metadata 提取 orders
@@ -728,9 +895,9 @@ export default function InboxPage() {
   }, [activeConv?.user_id]);
 
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
+    if (!scrollRef.current) return;
+    if (!shouldAutoScrollRef.current) return;
+    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
 
   useEffect(() => {
@@ -1212,7 +1379,12 @@ export default function InboxPage() {
                 >
                   清空缓存
                 </button>
-                <button className="px-3 py-1.5 text-xs font-medium border bg-white rounded-md text-gray-600 hover:bg-gray-50">转接同事</button>
+                <button
+                  onClick={handleToggleTestData}
+                  className="px-3 py-1.5 text-xs font-medium border bg-white rounded-md text-gray-600 hover:bg-gray-50"
+                >
+                  测试数据
+                </button>
                 
                 {/* AI 接管中 或 需人工 - 显示"接管对话"按钮 */}
                 {(isAI || isPending) && (
@@ -1253,8 +1425,129 @@ export default function InboxPage() {
           })()}
         </div>
 
+        {showTestData && (
+          <div className="absolute top-16 left-6 right-6 z-20">
+            <div className="bg-white border border-gray-200 rounded-xl shadow-lg p-4">
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <div className="text-sm font-semibold text-gray-900">退款测试订单</div>
+                  <div className="text-xs text-gray-500">来自 Supabase orders 表，已排除已退款订单</div>
+                </div>
+                <button
+                  onClick={() => setShowTestData(false)}
+                  className="text-xs text-gray-500 hover:text-gray-700"
+                >
+                  关闭
+                </button>
+              </div>
+              {testDataLoading && (
+                <div className="text-xs text-gray-400 py-6 text-center">测试数据加载中...</div>
+              )}
+              {!testDataLoading && testDataError && (
+                <div className="text-xs text-red-500 py-6 text-center">{testDataError}</div>
+              )}
+              {!testDataLoading && !testDataError && (
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                  <div>
+                    <div className="text-xs font-semibold text-green-700 mb-2">AI可退款</div>
+                    {testRefundable.length === 0 && (
+                      <div className="text-xs text-gray-400">暂无可退款订单</div>
+                    )}
+                    {testRefundable.length > 0 && (
+                      <div className="space-y-2">
+                    {testRefundable.map((item, idx) => {
+                          const key = item.order_id || `refund-${idx}`;
+                          const ret = testReturnsMap[item.order_id || ""];
+                          return (
+                            <div key={key} className="border border-gray-100 rounded-lg p-3">
+                              <div className="flex items-center justify-between text-[11px] text-gray-500">
+                                <span className="font-mono">{item.order_id || "--"}</span>
+                                <span>{formatDate(item.created_at)}</span>
+                              </div>
+                              <div className="text-sm font-semibold text-gray-900 mt-1">
+                                {item.paid_amount ? formatMoney(item.paid_amount) : "--"}
+                              </div>
+                              <div className="text-[11px] text-gray-500 mt-1">
+                                {ret ? getRefundStatusText(ret) || "可退款" : "可退款"}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-gray-500 mb-2">客服退款</div>
+                    {testNotRefundable.length === 0 && (
+                      <div className="text-xs text-gray-400">暂无不可退款订单</div>
+                    )}
+                    {testNotRefundable.length > 0 && (
+                      <div className="space-y-2">
+                    {testNotRefundable.map((item, idx) => {
+                          const key = item.order_id || `no-refund-${idx}`;
+                          const ret = testReturnsMap[item.order_id || ""];
+                          return (
+                            <div key={key} className="border border-gray-100 rounded-lg p-3">
+                              <div className="flex items-center justify-between text-[11px] text-gray-500">
+                                <span className="font-mono">{item.order_id || "--"}</span>
+                                <span>{formatDate(item.created_at)}</span>
+                              </div>
+                              <div className="text-sm font-semibold text-gray-900 mt-1">
+                                {item.paid_amount ? formatMoney(item.paid_amount) : "--"}
+                              </div>
+                              <div className="text-[11px] text-gray-500 mt-1">
+                                {ret ? getRefundStatusText(ret) || "需客服处理" : "需客服处理"}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-gray-500 mb-2">不可退款</div>
+                    {testUnrefundable.length === 0 && (
+                      <div className="text-xs text-gray-400">暂无不可退款订单</div>
+                    )}
+                    {testUnrefundable.length > 0 && (
+                      <div className="space-y-2">
+                        {testUnrefundable.map(({ order, reason }, idx) => {
+                          const key = order.order_id || `unrefund-${idx}`;
+                          return (
+                            <div key={key} className="border border-gray-100 rounded-lg p-3">
+                              <div className="flex items-center justify-between text-[11px] text-gray-500">
+                                <span className="font-mono">{order.order_id || "--"}</span>
+                                <span>{formatDate(order.created_at)}</span>
+                              </div>
+                              <div className="text-sm font-semibold text-gray-900 mt-1">
+                                {order.paid_amount ? formatMoney(order.paid_amount) : "--"}
+                              </div>
+                              <div className="text-[11px] text-gray-500 mt-1">
+                                {reason}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Chat Messages */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6" ref={scrollRef}>
+        <div
+          className="flex-1 overflow-y-auto p-6 space-y-6"
+          ref={scrollRef}
+          onScroll={() => {
+            const el = scrollRef.current;
+            if (!el) return;
+            const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+            shouldAutoScrollRef.current = distance < 120;
+          }}
+        >
           {activeId ? (
             messages.map((msg) => (
               <React.Fragment key={msg.id}>
