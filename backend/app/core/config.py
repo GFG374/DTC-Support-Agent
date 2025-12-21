@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     kimi_api_key: str = ""
     bailian_endpoint: str = ""
     bailian_token: str = ""
+    dashscope_api_key: str = Field("", env="DASHSCOPE_API_KEY")
+    dashscope_embedding_model: str = Field("text-embedding-v2", env="DASHSCOPE_EMBEDDING_MODEL")
     aliyun_asr_appkey: str = ""
     aliyun_asr_access_key_id: str = ""
     aliyun_asr_access_key_secret: str = ""

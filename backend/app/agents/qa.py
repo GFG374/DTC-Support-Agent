@@ -175,6 +175,12 @@ class QAAgent:
                     reason=tool_args.get("reason", "user_requested"),
                 )
                 tool_data["return_result"] = result
+                if result.get("action") == "transfer_to_human" or result.get("need_human"):
+                    tool_data["transfer"] = {
+                        "transferred": True,
+                        "reason": result.get("reason") or result.get("message") or "AI无法处理退款",
+                        "message": "需要人工客服继续处理退款问题。",
+                    }
             elif tool_name == "call_order_department":
                 result = self.order_agent.search_orders(
                     order_id=tool_args.get("order_id"),
@@ -279,4 +285,3 @@ class QAAgent:
                     raise last_error
         
         raise Exception(f"_get_final_response 失败: {str(last_error)}")
-

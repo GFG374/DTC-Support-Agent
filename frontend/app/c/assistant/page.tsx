@@ -29,6 +29,7 @@ type Msg = {
   role: "user" | "assistant" | "agent" | "system" | "ai_voice";
   content: string;
   created_at?: string;
+  updated_at?: string;
   conversation_id?: string;
   client_message_id?: string;
   audio_url?: string | null;
@@ -100,6 +101,7 @@ const formatSystemContent = (content: string) => {
 export default function AssistantPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [conversationStatus, setConversationStatus] = useState<"ai" | "pending_agent" | "agent" | "closed">("ai");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -111,6 +113,7 @@ export default function AssistantPage() {
   const [userProfile, setUserProfile] = useState<{ display_name?: string; avatar_url?: string } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; messageId: string; audioUrl?: string } | null>(null);
   const [transcribing, setTranscribing] = useState(false);
+  const [refreshTick, setRefreshTick] = useState(0);
   // 多选模式
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -220,7 +223,7 @@ export default function AssistantPage() {
         .from("conversations")
         .select("id")
         .eq("user_id", sess.user.id)
-        .order("created_at", { ascending: true })
+        .order("created_at", { ascending: false })
         .limit(1);
       if (convs && convs.length > 0) {
         setConversationId(convs[0].id);
@@ -238,6 +241,48 @@ export default function AssistantPage() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    let isMounted = true;
+
+    const loadStatus = async () => {
+      const { data, error } = await supabase
+        .from("conversations")
+        .select("status")
+        .eq("id", conversationId)
+        .single();
+      if (!isMounted) return;
+      if (!error && data?.status) {
+        setConversationStatus(data.status);
+      }
+    };
+    loadStatus();
+
+    const statusChannel = supabase
+      .channel(`c-conv-${conversationId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversations",
+          filter: `id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const updated = payload.new as { status?: string };
+          if (updated?.status) {
+            setConversationStatus(updated.status as typeof conversationStatus);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      isMounted = false;
+      supabase.removeChannel(statusChannel);
+    };
+  }, [conversationId]);
 
   // 消息加载和实时订阅
   useEffect(() => {
@@ -270,10 +315,13 @@ export default function AssistantPage() {
       if (!isMounted) return;
       
       if (!error && data) {
-        data.forEach(m => loadedMsgIds.add(m.id));
-        const merged = dedupe([...cachedMsgs, ...(data as Msg[])]);
+        const normalized = (data as Msg[]).map((row) => ({
+          ...row,
+          orders: row.orders || row.metadata?.orders,
+        }));
+        normalized.forEach((m) => loadedMsgIds.add(m.id));
+        const merged = dedupe(normalized);
         setMessages(merged);
-        // Update cache
         try {
           localStorage.setItem(cacheKey, JSON.stringify(merged));
         } catch (e) {
@@ -288,45 +336,106 @@ export default function AssistantPage() {
       .channel(`c-msgs-${conversationId}`)
       .on(
         "postgres_changes",
-        { 
-          event: "INSERT", 
-          schema: "public", 
+        {
+          event: "*",
+          schema: "public",
           table: "messages",
-          filter: `conversation_id=eq.${conversationId}`
+          filter: `conversation_id=eq.${conversationId}`,
         },
         (payload) => {
           if (!isMounted) return;
-          
-          const rawRow = payload.new as Msg;
-          // 从 metadata 提取 orders 数据
+
+          const rawRow = payload.new as Msg | undefined;
+          if (!rawRow) return;
           const newRow = { ...rawRow, orders: rawRow.orders || rawRow.metadata?.orders };
-          
-          // 严格去重
-          if (loadedMsgIds.has(newRow.id)) return;
-          loadedMsgIds.add(newRow.id);
-          
-          console.log('Realtime 收到其他用户消息:', newRow.id);
-          
-          setMessages((prev) => {
-            if (prev.some(m => m.id === newRow.id)) return prev;
-            const updated = [...prev, newRow];
-            // 更新缓存
-            try {
-              localStorage.setItem(cacheKey, JSON.stringify(updated));
-            } catch (e) {}
-            return updated;
-          });
+
+          if (payload.eventType === "UPDATE") {
+            loadedMsgIds.add(newRow.id);
+            setMessages((prev) => {
+              const existing = prev.find((m) => m.id === newRow.id);
+              const updated = existing
+                ? prev.map((m) => (m.id === newRow.id ? { ...m, ...newRow } : m))
+                : [...prev, newRow];
+              try {
+                localStorage.setItem(cacheKey, JSON.stringify(updated));
+              } catch (e) {}
+              return updated;
+            });
+            return;
+          }
+
+          if (payload.eventType === "INSERT") {
+            if (loadedMsgIds.has(newRow.id)) return;
+            loadedMsgIds.add(newRow.id);
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === newRow.id)) return prev;
+              const updated = [...prev, newRow];
+              try {
+                localStorage.setItem(cacheKey, JSON.stringify(updated));
+              } catch (e) {}
+              return updated;
+            });
+          }
         }
       )
       .subscribe((status) => {
         console.log("C端 Realtime 订阅状态:", status);
       });
 
+    const pollInterval = setInterval(async () => {
+      if (!isMounted) return;
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true });
+
+      if (error || !data) return;
+      const fetched = (data as Msg[]).map((row) => ({
+        ...row,
+        orders: row.orders || row.metadata?.orders,
+      }));
+
+      setMessages((prev) => {
+        if (fetched.length === 0) return prev;
+        const prevMap = new Map(prev.map((m) => [m.id, m]));
+        let changed = false;
+        const merged = fetched.map((msg) => {
+          const existing = prevMap.get(msg.id);
+          if (!existing) {
+            changed = true;
+            return msg;
+          }
+          if (
+            existing.content !== msg.content ||
+            existing.role !== msg.role ||
+            existing.updated_at !== msg.updated_at ||
+            existing.transcript !== msg.transcript
+          ) {
+            changed = true;
+            return { ...existing, ...msg };
+          }
+          return existing;
+        });
+        if (!changed && merged.length === prev.length) return prev;
+        merged.sort((a, b) => {
+          const at = new Date(a.created_at || 0).getTime();
+          const bt = new Date(b.created_at || 0).getTime();
+          return at - bt;
+        });
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(merged));
+        } catch (e) {}
+        return merged;
+      });
+    }, 3000);
+
     return () => {
       isMounted = false;
+      clearInterval(pollInterval);
       supabase.removeChannel(channel);
     };
-  }, [conversationId]);
+  }, [conversationId, refreshTick]);
 
   // 加载客服头像
   useEffect(() => {
@@ -476,8 +585,13 @@ export default function AssistantPage() {
         });
       }
       
-      // 3. Call AI; reply is persisted by client
-      const aiMessageId = createMessageId();
+        // 3. Call AI; reply is persisted by client
+        const isHumanMode = conversationStatus === "agent";
+        if (isHumanMode) {
+          return;
+        }
+
+        const aiMessageId = createMessageId();
       const aiTempMsg: Msg = {
         id: aiMessageId,
         role: 'assistant',
@@ -499,7 +613,11 @@ export default function AssistantPage() {
           "Content-Type": "application/json",
           Authorization: session ? `Bearer ${session.access_token}` : "",
         },
-        body: JSON.stringify({ conversation_id: conversationId ?? undefined, message: text }),
+        body: JSON.stringify({
+          conversation_id: conversationId ?? undefined,
+          message: text,
+          assistant_message_id: aiMessageId,
+        }),
       });
       
       if (!response.ok) {
@@ -617,6 +735,17 @@ export default function AssistantPage() {
     } finally {
       setSending(false);
     }
+  };
+
+  const handleClearCache = () => {
+    if (!conversationId) return;
+    const cacheKey = `chat_messages_${conversationId}`;
+    try {
+      localStorage.removeItem(cacheKey);
+    } catch (e) {}
+    setMessages([]);
+    setError(null);
+    setRefreshTick((prev) => prev + 1);
   };
 
   const handlePressStart = async (e: React.TouchEvent | React.MouseEvent) => {
@@ -830,10 +959,11 @@ export default function AssistantPage() {
             "Content-Type": "application/json",
             Authorization: session ? `Bearer ${session.access_token}` : "",
           },
-          body: JSON.stringify({ 
-            conversation_id: conversationId ?? undefined, 
+          body: JSON.stringify({
+            conversation_id: conversationId ?? undefined,
             audio_url: publicUrl,
-            is_voice: true 
+            is_voice: true,
+            assistant_message_id: aiMessageId,
           }),
         });
         
@@ -983,13 +1113,18 @@ export default function AssistantPage() {
         });
       }
       
-      await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 1000));
 
-      await fetch("/api/chat-agent", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: session ? `Bearer ${session.access_token}` : "",
+        const isHumanMode = conversationStatus === "agent";
+        if (isHumanMode) {
+          return;
+        }
+
+        await fetch("/api/chat-agent", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: session ? `Bearer ${session.access_token}` : "",
         },
         body: JSON.stringify({ 
           conversation_id: conversationId ?? undefined, 
@@ -1073,6 +1208,19 @@ export default function AssistantPage() {
             <div className="font-bold text-sm text-slate-900">智能客服</div>
             <div className="text-[11px] text-green-600 flex items-center gap-1">● 在线 · 实时回复</div>
           </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {conversationId && (
+            <span className="text-[11px] text-slate-400 border border-slate-200 rounded-full px-2 py-0.5">
+              会话 {conversationId.slice(0, 8)}
+            </span>
+          )}
+          <button
+            onClick={handleClearCache}
+            className="text-xs text-slate-500 border border-slate-200 px-2.5 py-1 rounded-full hover:bg-slate-50"
+          >
+            清空缓存
+          </button>
         </div>
       </div>
 

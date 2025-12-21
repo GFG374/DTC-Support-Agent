@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import approvals, chat, conversations, orders, admin_invites, invites, register, account, admin_conversations, transcribe, users, admin_returns
+from .api import approvals, chat, conversations, orders, admin_invites, invites, register, account, admin_conversations, transcribe, users, admin_returns, admin_orders
 from .core.auth import User, get_current_user
 from .core.config import settings
 from .core.supabase import get_supabase_admin_client
@@ -28,6 +28,7 @@ app.include_router(admin_invites.router)
 app.include_router(account.router)
 app.include_router(admin_conversations.router, prefix="/api")
 app.include_router(admin_returns.router, prefix="/api")
+app.include_router(admin_orders.router, prefix="/api")
 app.include_router(transcribe.router)
 app.include_router(users.router, prefix="/api")
 

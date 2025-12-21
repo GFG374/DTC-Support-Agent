@@ -117,30 +117,37 @@ class AlipayClient:
 
         async with httpx.AsyncClient(timeout=30.0, verify=self.verify_ssl) as client:
             response = await client.post(self.gateway, data=params)
-            try:
-                result = response.json()
-                response_key = method.replace(".", "_") + "_response"
-                return result.get(response_key, {})
-            except UnicodeDecodeError:
+            response_key = method.replace(".", "_") + "_response"
+            
+            # Alipay sandbox may return GBK-encoded responses despite charset=utf-8 in request.
+            # Try to decode with multiple encodings.
+            raw_content = response.content
+            text = None
+            
+            # Try UTF-8 first, then GBK (common for Chinese payment gateways)
+            for encoding in ["utf-8", "gbk", "gb2312", "gb18030"]:
                 try:
-                    # Some Alipay responses may use GBK encoding.
-                    result = response.json(encoding="gbk")
-                    response_key = method.replace(".", "_") + "_response"
-                    return result.get(response_key, {})
-                except Exception as exc:
-                    return {
-                        "code": None,
-                        "msg": "invalid_json",
-                        "sub_msg": f"{exc}",
-                        "raw": response.content[:500].decode(errors="ignore"),
-                    }
-            except Exception as exc:
-                # Fall back to raw text for easier debugging when encoding is unexpected.
+                    text = raw_content.decode(encoding)
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            
+            if text is None:
+                # Fallback: decode with errors ignored
+                text = raw_content.decode("utf-8", errors="ignore")
+            
+            try:
+                result = json.loads(text)
+                inner = result.get(response_key, {})
+                # Attach raw response for debugging
+                inner["raw"] = text[:1000] if len(text) > 1000 else text
+                return inner
+            except json.JSONDecodeError as exc:
                 return {
                     "code": None,
                     "msg": "invalid_json",
-                    "sub_msg": f"{exc}",
-                    "raw": response.text[:500],
+                    "sub_msg": f"JSON parse error: {exc}",
+                    "raw": text[:500] if text else raw_content[:500].decode(errors="ignore"),
                 }
 
     def _sign(self, params: Dict) -> str:
