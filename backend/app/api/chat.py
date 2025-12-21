@@ -299,9 +299,18 @@ async def chat_with_kimi(
             from ..core.supabase import get_supabase_admin_client
 
             client = get_supabase_admin_client()
-            client.table("conversations").update({"status": "pending_agent"}).eq(
-                "id", conversation_id
-            ).execute()
+            conv_res = (
+                client.table("conversations")
+                .select("status")
+                .eq("id", conversation_id)
+                .limit(1)
+                .execute()
+            )
+            current_status = conv_res.data[0].get("status") if conv_res.data else None
+            if current_status != "agent":
+                client.table("conversations").update({"status": "pending_agent"}).eq(
+                    "id", conversation_id
+                ).execute()
 
             ai_reply = (
                 "您好，我正在为您联系人工客服，请稍候~\n"
@@ -432,9 +441,18 @@ async def chat_with_agent(
             if transfer_reason:
                 print(f"[Agent] transfer to human, reason: {transfer_reason}")
 
-                db_client.table("conversations").update({"status": "pending_agent"}).eq(
-                    "id", conversation_id
-                ).execute()
+                conv_res = (
+                    db_client.table("conversations")
+                    .select("status")
+                    .eq("id", conversation_id)
+                    .limit(1)
+                    .execute()
+                )
+                current_status = conv_res.data[0].get("status") if conv_res.data else None
+                if current_status != "agent":
+                    db_client.table("conversations").update({"status": "pending_agent"}).eq(
+                        "id", conversation_id
+                    ).execute()
 
                 system_msg = f"TRANSFER_TO_HUMAN: {transfer_reason}"
                 db_client.table("messages").insert(
